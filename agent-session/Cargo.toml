@@ -1,0 +1,19 @@
+[package]
+name = "agent-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# wo deps: session tree, JSONL persistence, compaction, event bus, queues, orchestration.
+agent-ai = { path = "../agent-ai" }
+agent-core = { path = "../agent-core" }
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

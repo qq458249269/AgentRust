@@ -1,0 +1,21 @@
+[package]
+name = "agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+# wo deps: thin frontends (rpc/json/print) over the session runtime.
+agent-ai = { path = "../agent-ai" }
+agent-core = { path = "../agent-core" }
+agent-session = { path = "../agent-session" }
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
