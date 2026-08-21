@@ -44,12 +44,8 @@ jobs:
         id: version
         shell: bash
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            VERSION="${{ github.ref_name }}"
-          else
-            DATE=$(date +%Y%m%d)
-            VERSION="0.${DATE}.${{ github.run_number }}"
-          fi
+          DATE=$(date +%Y%m%d)
+          VERSION="0.${DATE}.${{ github.run_number }}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "版本号: ${VERSION}"
 
