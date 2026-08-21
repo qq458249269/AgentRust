@@ -3,6 +3,7 @@ name: 构建 Windows x86_64
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -43,8 +44,12 @@ jobs:
         id: version
         shell: bash
         run: |
-          DATE=$(date +%Y%m%d)
-          VERSION="0.${DATE}.${{ github.run_number }}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            DATE=$(date +%Y%m%d)
+            VERSION="0.${DATE}.${{ github.run_number }}"
+          fi
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "版本号: ${VERSION}"
 
@@ -74,6 +79,7 @@ jobs:
   release:
     needs: build-windows-x86_64
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
@@ -82,9 +88,6 @@ jobs:
         with:
           path: artifacts
           pattern: agent-windows-x86_64-*
-
-      - name: 查看产物
-        run: find artifacts/ -type f
 
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
