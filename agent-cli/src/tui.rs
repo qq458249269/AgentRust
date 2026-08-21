@@ -516,8 +516,8 @@ async fn run_loop(
 
         terminal.draw(|f| draw(f, &mut app))?;
 
-        let poll_ms = if app.busy { 100 } else { 100 };
-        if event::poll(Duration::from_millis(poll_ms))? {
+        const POLL_MS: u64 = 100;
+        if event::poll(Duration::from_millis(POLL_MS))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press
                     && !handle_key(&mut app, k.code, k.modifiers)
