@@ -16,6 +16,7 @@ use agent_ai::provider::{
     ProviderRequest,
 };
 use agent_session::AgentSession;
+use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -38,6 +39,8 @@ pub async fn run(_session: AgentSession, _cli: &CommonArgs) -> anyhow::Result<()
 struct ChatItem {
     role: String,
     text: String,
+    /// 发送/接收时间（HH:MM:SS）
+    time: String,
 }
 
 impl ChatItem {
@@ -45,6 +48,7 @@ impl ChatItem {
         Self {
             role: role.to_string(),
             text: text.to_string(),
+            time: Local::now().format("%H:%M:%S").to_string(),
         }
     }
 }
@@ -435,65 +439,73 @@ async fn run_loop(
     app.load_form();
 
     loop {
-        // drain stream messages
+        // drain stream messages: collect first to avoid borrow conflicts
+        let mut msgs = Vec::new();
         if let Some(rx) = &mut app.stream_rx {
-            let mut finished = false;
             while let Ok(msg) = rx.try_recv() {
-                tracing::trace!("收到消息: {:?}", std::mem::discriminant(&msg));
-                match msg {
-                    StreamMsg::Delta(d) => {
-                        tracing::debug!("TUI 收到 Delta: {} 字节", d.len());
-                        if let Some(idx) = app.streaming_item {
-                            app.history[idx].text.push_str(&d);
-                        }
-                    }
-                    StreamMsg::Done(s) => {
-                        if s.starts_with("用量：") {
-                            app.usage_str = s.clone();
-                            // Parse tokens for stats
-                            for part in s.split_whitespace() {
-                                if let Some(val) = part.strip_prefix("输入=") {
-                                    if let Ok(n) = val.parse::<u64>() {
-                                        app.total_input_tokens += n;
-                                    }
-                                }
-                                if let Some(val) = part.strip_prefix("输出=") {
-                                    if let Ok(n) = val.parse::<u64>() {
-                                        app.total_output_tokens += n;
-                                    }
-                                }
-                            }
-                        } else {
-                            app.busy = false;
-                            app.streaming_item = None;
-                            app.status = if app.usage_str.is_empty() {
-                                s
-                            } else {
-                                app.usage_str.clone()
-                            };
-                            app.usage_str = String::new();
-                        }
-                    }
-                    StreamMsg::Err(e) => {
-                        app.status = format!("错误：{e}");
-                        app.history
-                            .push(ChatItem::new("system", &format!("错误：{e}")));
-                        app.busy = false;
-                        app.stream_rx = None;
-                        app.stream_tx = None;
-                        app.streaming_item = None;
-                        finished = true;
-                        break;
+                msgs.push(msg);
+            }
+        }
+        let mut finished = false;
+        for msg in msgs {
+            match msg {
+                StreamMsg::Delta(d) => {
+                    if let Some(idx) = app.streaming_item {
+                        app.history[idx].text.push_str(&d);
                     }
                 }
+                StreamMsg::Done(s) => {
+                    if s.starts_with("用量：") {
+                        app.usage_str = s.clone();
+                        for part in s.split_whitespace() {
+                            if let Some(val) = part.strip_prefix("输入=") {
+                                if let Ok(n) = val.parse::<u64>() {
+                                    app.total_input_tokens += n;
+                                }
+                            }
+                            if let Some(val) = part.strip_prefix("输出=") {
+                                if let Ok(n) = val.parse::<u64>() {
+                                    app.total_output_tokens += n;
+                                }
+                            }
+                        }
+                    } else {
+                        // 结束事件：重置 busy 状态
+                        tracing::info!("TUI 处理 Done: {s}");
+                        app.busy = false;
+                        if let Some(idx) = app.streaming_item {
+                            app.history[idx].time =
+                                Local::now().format("%H:%M:%S").to_string();
+                        }
+                        app.streaming_item = None;
+                        app.status = if app.usage_str.is_empty() {
+                            s
+                        } else {
+                            app.usage_str.clone()
+                        };
+                        app.usage_str = String::new();
+                    }
+                }
+                StreamMsg::Err(e) => {
+                    app.status = format!("错误：{e}");
+                    app.history
+                        .push(ChatItem::new("system", &format!("错误：{e}")));
+                    app.busy = false;
+                    app.stream_rx = None;
+                    app.stream_tx = None;
+                    app.streaming_item = None;
+                    finished = true;
+                }
             }
-            if app.stream_rx.is_some() && !app.busy && app.streaming_item.is_none() {
-                app.stream_rx = None;
-                app.stream_tx = None;
-            }
-            if finished {
-                continue;
-            }
+        }
+        if finished {
+            app.stream_rx = None;
+            app.stream_tx = None;
+            continue;
+        }
+        if app.stream_rx.is_some() && !app.busy && app.streaming_item.is_none() {
+            app.stream_rx = None;
+            app.stream_tx = None;
         }
 
         // Update spinner
@@ -568,6 +580,10 @@ fn draw_chat(f: &mut Frame, app: &mut ChatApp) {
                         Style::default()
                             .fg(role_color)
                             .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        format!("[{}] ", item.time),
+                        Style::default().fg(Color::DarkGray),
                     ));
                 } else {
                     // Continuation lines: align with text start
