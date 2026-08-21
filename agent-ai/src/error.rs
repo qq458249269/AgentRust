@@ -4,15 +4,15 @@ use thiserror::Error;
 /// cheap Clone in parallel tool result batching; full detail lives in logs.
 #[derive(Debug, Clone, Error)]
 pub enum AiError {
-    #[error("http error: {0}")]
+    #[error("HTTP 错误: {0}")]
     Http(String),
-    #[error("stream error: {0}")]
+    #[error("流错误: {0}")]
     Stream(String),
-    #[error("provider error {status}: {body}")]
+    #[error("服务商错误 {status}: {body}")]
     Provider { status: u16, body: String },
-    #[error("rate limited (429), retry-after {0:?}s")]
+    #[error("请求频率限制 (429)，重试等待 {0:?}秒")]
     RateLimited(Option<u64>),
-    #[error("serialization error: {0}")]
+    #[error("序列化错误: {0}")]
     Json(String),
     #[error("{0}")]
     Other(String),

@@ -81,7 +81,7 @@ impl ChatProvider for AnthropicProvider {
     ) -> Result<ProviderResponse, AiError> {
         if self.api_key.is_empty() {
             return Err(AiError::Other(
-                "no API key configured; set --api-key, auth.json, or the provider env var".into(),
+                "未配置 API 密钥；请通过 --api-key、auth.json 或环境变量设置".into(),
             ));
         }
         let messages: Vec<Value> = req.messages.iter().map(conv_message).collect();
@@ -257,7 +257,7 @@ impl AnthropicParser {
                                 .to_string(),
                         }))
                         .await
-                        .map_err(|_| AiError::Other("stream closed".into()))?;
+                        .map_err(|_| AiError::Other("流已关闭".into()))?;
                     }
                 }
             }
@@ -272,7 +272,7 @@ impl AnthropicParser {
                                 .to_string();
                             tx.send(Ok(StreamEvent::TextDelta { delta: t }))
                                 .await
-                                .map_err(|_| AiError::Other("stream closed".into()))?;
+                                .map_err(|_| AiError::Other("流已关闭".into()))?;
                         }
                         Some("thinking_delta") => {
                             let t = delta
@@ -282,7 +282,7 @@ impl AnthropicParser {
                                 .to_string();
                             tx.send(Ok(StreamEvent::ThinkingDelta { delta: t }))
                                 .await
-                                .map_err(|_| AiError::Other("stream closed".into()))?;
+                                .map_err(|_| AiError::Other("流已关闭".into()))?;
                         }
                         Some("input_json_delta") => {
                             let id = ev
@@ -298,7 +298,7 @@ impl AnthropicParser {
                                 .to_string();
                             tx.send(Ok(StreamEvent::ToolCallArgsDelta { id, delta: d }))
                                 .await
-                                .map_err(|_| AiError::Other("stream closed".into()))?;
+                                .map_err(|_| AiError::Other("流已关闭".into()))?;
                         }
                         _ => {}
                     }
@@ -338,11 +338,11 @@ impl AnthropicParser {
                 };
                 tx.send(Ok(StreamEvent::Usage { usage }))
                     .await
-                    .map_err(|_| AiError::Other("stream closed".into()))?;
+                    .map_err(|_| AiError::Other("流已关闭".into()))?;
                 let sr = self.last_stop;
                 tx.send(Ok(StreamEvent::Done { stop_reason: sr }))
                     .await
-                    .map_err(|_| AiError::Other("stream closed".into()))?;
+                    .map_err(|_| AiError::Other("流已关闭".into()))?;
             }
             _ => {}
         }

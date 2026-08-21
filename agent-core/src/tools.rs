@@ -79,7 +79,7 @@ impl ToolRegistry {
                 let tool = match tools.get(&name) {
                     Some(t) => t,
                     None => {
-                        return (i, Err(CoreError::Tool(format!("unknown tool {name}"))));
+                        return (i, Err(CoreError::Tool(format!("未知工具 {name}"))));
                     }
                 };
                 (i, tool.execute(&args, &cancel, None).await)

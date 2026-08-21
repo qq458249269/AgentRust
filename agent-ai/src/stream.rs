@@ -44,7 +44,9 @@ pub enum StreamEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum StopReason {
+    #[default]
     Stop,
     Length,
     ToolUse,
@@ -52,11 +54,6 @@ pub enum StopReason {
     Aborted,
 }
 
-impl Default for StopReason {
-    fn default() -> Self {
-        StopReason::Stop
-    }
-}
 
 /// Raw line source; adapters (SSE chunk splitter) implement this.
 #[derive(Debug)]
@@ -200,7 +197,7 @@ pub fn spawn_sse_producer(
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    let _ = splitter.out_send_err(AiError::from(e));
+                    splitter.out_send_err(AiError::from(e));
                     return;
                 }
             }

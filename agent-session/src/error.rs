@@ -2,12 +2,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
-    #[error("io error: {0}")]
+    #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
-    #[error("json error: {0}")]
+    #[error("JSON 错误: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("core error: {0}")]
+    #[error("核心错误: {0}")]
     Core(#[from] agent_core::CoreError),
-    #[error("corrupt session file at line {line}: {message}")]
+    #[error("会话文件损坏，第 {line} 行: {message}")]
     Corrupt { line: usize, message: String },
 }

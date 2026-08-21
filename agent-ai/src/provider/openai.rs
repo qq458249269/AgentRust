@@ -68,7 +68,7 @@ impl ChatProvider for OpenAiChatProvider {
     ) -> Result<ProviderResponse, AiError> {
         if self.api_key.is_empty() {
             return Err(AiError::Other(
-                "no API key configured; set --api-key, auth.json, or the provider env var".into(),
+                "未配置 API 密钥；请通过 --api-key、auth.json 或环境变量设置".into(),
             ));
         }
         let body = chat_body(req)?;
@@ -131,7 +131,7 @@ impl ChatProvider for OpenAiResponsesProvider {
         _req: &ProviderRequest,
     ) -> Result<ProviderResponse, AiError> {
         Err(AiError::Other(
-            "openai responses API not implemented yet; use 'openai chat'".into(),
+            "OpenAI Responses API 尚未实现；请使用 'openai chat'".into(),
         ))
     }
 }
@@ -152,7 +152,7 @@ impl ChatProvider for PendingProvider {
         _req: &ProviderRequest,
     ) -> Result<ProviderResponse, AiError> {
         Err(AiError::Other(format!(
-            "provider '{} {}' is registered but not implemented yet",
+            "服务商 '{} {}' 已注册但尚未实现",
             self.vendor,
             match self.api {
                 ApiVariant::Chat => "chat",
@@ -306,7 +306,7 @@ impl ChatCompletionsParser {
                 let sr = self.stop;
                 tx.send(Ok(StreamEvent::Done { stop_reason: sr }))
                     .await
-                    .map_err(|_| AiError::Other("stream closed".into()))?;
+                    .map_err(|_| AiError::Other("流已关闭".into()))?;
             }
             return Ok(());
         }
@@ -331,7 +331,7 @@ impl ChatCompletionsParser {
                         delta: text.clone(),
                     }))
                     .await
-                    .map_err(|_| AiError::Other("stream closed".into()))?;
+                    .map_err(|_| AiError::Other("流已关闭".into()))?;
                 }
             }
             if let Some(calls) = &choice.delta.tool_calls {
@@ -360,7 +360,7 @@ impl ChatCompletionsParser {
                                     name: slot.1.clone(),
                                 }))
                                 .await
-                                .map_err(|_| AiError::Other("stream closed".into()))?;
+                                .map_err(|_| AiError::Other("流已关闭".into()))?;
                                 self.current_idx = Some(idx);
                             }
                             tx.send(Ok(StreamEvent::ToolCallArgsDelta {
@@ -368,7 +368,7 @@ impl ChatCompletionsParser {
                                 delta: args_delta.clone(),
                             }))
                             .await
-                            .map_err(|_| AiError::Other("stream closed".into()))?;
+                            .map_err(|_| AiError::Other("流已关闭".into()))?;
                         }
                     }
                 }
@@ -393,12 +393,12 @@ impl ChatCompletionsParser {
                     };
                     tx.send(Ok(StreamEvent::Usage { usage }))
                         .await
-                        .map_err(|_| AiError::Other("stream closed".into()))?;
+                        .map_err(|_| AiError::Other("流已关闭".into()))?;
                 }
                 let sr = self.stop;
                 tx.send(Ok(StreamEvent::Done { stop_reason: sr }))
                     .await
-                    .map_err(|_| AiError::Other("stream closed".into()))?;
+                    .map_err(|_| AiError::Other("流已关闭".into()))?;
             }
         }
         Ok(())

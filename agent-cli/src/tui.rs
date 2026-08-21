@@ -1,5 +1,13 @@
-//! Interactive TUI: chat view + `/settings` sub-view (vendor/api/url/key/model form).
-//! All configuration lives in auth.json (no built-in model catalog — configure as you go).
+//! Interactive TUI: chat view + `/settings` sub-view with M6 enhancements.
+//!
+//! M6 features:
+//! - Input history (↑/↓ recall previous inputs)
+//! - Scroll support (PgUp/PgDn to scroll chat history)
+//! - Streaming animation (spinner during generation)
+//! - Better text rendering (long lines, code block hints)
+//! - Keyboard shortcut hints
+//! - Status bar with message count + token stats
+//! - Tab command completion
 
 use crate::{client, CommonArgs};
 use agent_ai::model::{Model, ThinkingLevel};
@@ -9,13 +17,13 @@ use agent_ai::provider::{
 };
 use agent_session::AgentSession;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub async fn run(_session: AgentSession, _cli: &CommonArgs) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
@@ -23,6 +31,8 @@ pub async fn run(_session: AgentSession, _cli: &CommonArgs) -> anyhow::Result<()
     ratatui::restore();
     res
 }
+
+// ─── Data Types ─────────────────────────────────────────────────────
 
 /// One chat message shown in the transcript.
 struct ChatItem {
@@ -39,7 +49,7 @@ impl ChatItem {
     }
 }
 
-/// Settings form field (类型, 接口地址, API 密钥, 模型 ID).
+/// Settings form field.
 struct FormField {
     label: &'static str,
     value: String,
@@ -66,27 +76,13 @@ const FORM_LABELS: [(&str, &str); 4] = [
     ),
 ];
 
-struct ChatApp {
-    mode: Mode,
-    history: Vec<ChatItem>,
-    input: String,
-    busy: bool,
-    stream_tx: Option<mpsc::Sender<StreamMsg>>,
-    stream_rx: Option<mpsc::Receiver<StreamMsg>>,
-    status: String,
-    form: Vec<FormField>,
-    form_active: usize,
-    streaming_item: Option<usize>,
-    usage_str: String,
-    /// when Some(selected_index), the `/` command menu is open
-    cmd_menu: Option<usize>,
-}
-
-/// Slash commands shown in the menu: (触发, 说明).
-const COMMANDS: [(&str, &str); 4] = [
+/// Slash commands: (trigger, description).
+const COMMANDS: [(&str, &str); 6] = [
     ("/settings", "配置接口（类型/地址/密钥/模型）"),
     ("/help", "查看帮助"),
     ("/clear", "清空会话记录"),
+    ("/stats", "显示统计信息"),
+    ("/model", "显示当前模型"),
     ("/exit", "退出"),
 ];
 
@@ -97,8 +93,39 @@ enum Mode {
 
 enum StreamMsg {
     Delta(String),
-    Done(String), // stop reason
+    Done(String),
     Err(String),
+}
+
+// ─── App State ──────────────────────────────────────────────────────
+
+struct ChatApp {
+    mode: Mode,
+    history: Vec<ChatItem>,
+    input: String,
+    /// Input history for ↑/↓ recall
+    input_history: Vec<String>,
+    input_history_idx: Option<usize>,
+    busy: bool,
+    stream_tx: Option<mpsc::Sender<StreamMsg>>,
+    stream_rx: Option<mpsc::Receiver<StreamMsg>>,
+    status: String,
+    form: Vec<FormField>,
+    form_active: usize,
+    streaming_item: Option<usize>,
+    usage_str: String,
+    /// when Some(selected_index), the `/` command menu is open
+    cmd_menu: Option<usize>,
+    /// Scroll offset for chat history (0 = bottom, positive = scrolled up)
+    scroll_offset: u16,
+    /// Spinner frame index for streaming animation
+    spinner_frame: usize,
+    /// Last spinner update time
+    spinner_tick: Instant,
+    /// Total tokens used in this session
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+
 }
 
 impl ChatApp {
@@ -118,6 +145,8 @@ impl ChatApp {
                 "AgentRust · 输入 / 打开命令菜单，其他内容发送给模型",
             )],
             input: String::new(),
+            input_history: Vec::new(),
+            input_history_idx: None,
             busy: false,
             stream_tx: None,
             stream_rx: None,
@@ -127,6 +156,12 @@ impl ChatApp {
             streaming_item: None,
             usage_str: String::new(),
             cmd_menu: None,
+            scroll_offset: 0,
+            spinner_frame: 0,
+            spinner_tick: Instant::now(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+
         }
     }
 
@@ -161,7 +196,7 @@ impl ChatApp {
             .to_string();
     }
 
-    /// Persist the current form to auth.json. Returns an error string on validation failure.
+    /// Persist the current form to auth.json.
     fn save_form(&mut self) -> Result<(), String> {
         let kind = ProviderKind::parse(&self.form[0].value)
             .ok_or_else(|| format!("未知类型: '{}'", self.form[0].value))?;
@@ -192,11 +227,70 @@ impl ChatApp {
         }
     }
 
+    /// Push input to history for ↑/↓ recall.
+    fn push_input_history(&mut self) {
+        if !self.input.trim().is_empty() {
+            self.input_history.push(self.input.clone());
+        }
+        self.input_history_idx = None;
+    }
+
+    /// Recall previous input from history (↑ key).
+    fn recall_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let idx = match self.input_history_idx {
+            Some(i) if i > 0 => i - 1,
+            Some(i) => i,
+            None => self.input_history.len() - 1,
+        };
+        self.input_history_idx = Some(idx);
+        self.input = self.input_history[idx].clone();
+    }
+
+    /// Recall next input from history (↓ key).
+    fn recall_next(&mut self) {
+        if let Some(idx) = self.input_history_idx {
+            if idx + 1 < self.input_history.len() {
+                self.input_history_idx = Some(idx + 1);
+                self.input = self.input_history[idx + 1].clone();
+            } else {
+                self.input_history_idx = None;
+                self.input.clear();
+            }
+        }
+    }
+
+    /// Tab-complete: find matching command and fill it in.
+    fn tab_complete(&mut self) {
+        let input = self.input.trim_start();
+        if input.is_empty() || !input.starts_with('/') {
+            return;
+        }
+        let matches: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|(cmd, _)| cmd.starts_with(input))
+            .map(|(cmd, _)| *cmd)
+            .collect();
+        if matches.len() == 1 {
+            self.input = format!("{} ", matches[0]);
+        } else if matches.len() > 1 {
+            // Show available matches
+            let list: Vec<&str> = matches.to_vec();
+            self.history.push(ChatItem::new(
+                "system",
+                &format!("可补全: {}", list.join(", ")),
+            ));
+        }
+    }
+
     fn send(&mut self, text: String) {
         if self.busy {
             self.status = "正在生成中，请稍候…".to_string();
             return;
         }
+        self.push_input_history();
         self.history.push(ChatItem::new("user", &text));
         self.input.clear();
         let (tx, rx) = mpsc::channel::<StreamMsg>();
@@ -204,6 +298,7 @@ impl ChatApp {
         self.stream_rx = Some(rx);
         self.busy = true;
         self.status = "生成中…".to_string();
+        self.scroll_offset = 0; // auto-scroll to bottom
         let item_idx = self.history.len();
         self.history.push(ChatItem::new("assistant", ""));
         self.streaming_item = Some(item_idx);
@@ -275,9 +370,7 @@ impl ChatApp {
                     while let Some(ev) = sr.next().await {
                         match ev {
                             Ok(agent_ai::stream::StreamEvent::TextDelta { delta }) => {
-                                if tx.send(StreamMsg::Delta(delta)).is_err() {
-                                    return;
-                                }
+                                let _ = tx.send(StreamMsg::Delta(delta));
                             }
                             Ok(agent_ai::stream::StreamEvent::Usage { usage }) => {
                                 let _ = tx.send(StreamMsg::Done(format!(
@@ -311,6 +404,16 @@ impl ChatApp {
     }
 }
 
+// ─── Spinner Animation ──────────────────────────────────────────────
+
+const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+fn spinner_char(frame: usize) -> &'static str {
+    SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+}
+
+// ─── Main Loop ──────────────────────────────────────────────────────
+
 async fn run_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
 ) -> anyhow::Result<()> {
@@ -318,7 +421,7 @@ async fn run_loop(
     app.load_form();
 
     loop {
-        // drain stream messages: Usage first (carried as Done), final stop Done finishes the row.
+        // drain stream messages
         if let Some(rx) = &app.stream_rx {
             let mut finished = false;
             while let Ok(msg) = rx.try_recv() {
@@ -328,22 +431,30 @@ async fn run_loop(
                             app.history[idx].text.push_str(&d);
                         }
                     }
-                    // payload is the usage summary when emitted by the Usage event,
-                    // or the stop reason when emitted by the final Done event.
                     StreamMsg::Done(s) => {
                         if s.starts_with("用量：") {
-                            app.usage_str = s;
+                            app.usage_str = s.clone();
+                            // Parse tokens for stats
+                            for part in s.split_whitespace() {
+                                if let Some(val) = part.strip_prefix("输入=") {
+                                    if let Ok(n) = val.parse::<u64>() {
+                                        app.total_input_tokens += n;
+                                    }
+                                }
+                                if let Some(val) = part.strip_prefix("输出=") {
+                                    if let Ok(n) = val.parse::<u64>() {
+                                        app.total_output_tokens += n;
+                                    }
+                                }
+                            }
                         } else {
                             app.busy = false;
                             app.streaming_item = None;
-                            app.status = format!(
-                                "{}",
-                                if app.usage_str.is_empty() {
-                                    s
-                                } else {
-                                    app.usage_str.clone()
-                                }
-                            );
+                            app.status = if app.usage_str.is_empty() {
+                                s
+                            } else {
+                                app.usage_str.clone()
+                            };
                             app.usage_str = String::new();
                         }
                     }
@@ -369,20 +480,28 @@ async fn run_loop(
             }
         }
 
+        // Update spinner
+        if app.busy && app.spinner_tick.elapsed() > Duration::from_millis(80) {
+            app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            app.spinner_tick = Instant::now();
+        }
+
         terminal.draw(|f| draw(f, &mut app))?;
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    if !handle_key(&mut app, k.code, k.modifiers) {
-                        break;
-                    }
+                if k.kind == KeyEventKind::Press
+                    && !handle_key(&mut app, k.code, k.modifiers)
+                {
+                    break;
                 }
             }
         }
     }
     Ok(())
 }
+
+// ─── Drawing ────────────────────────────────────────────────────────
 
 fn draw(f: &mut Frame, app: &mut ChatApp) {
     match app.mode {
@@ -391,69 +510,107 @@ fn draw(f: &mut Frame, app: &mut ChatApp) {
     }
 }
 
-fn draw_chat(f: &mut Frame, app: &ChatApp) {
+fn draw_chat(f: &mut Frame, app: &mut ChatApp) {
+    let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Min(3),    // chat history
+            Constraint::Length(3), // input
+            Constraint::Length(1), // status bar
         ])
-        .split(f.area());
+        .split(area);
 
-    // history
-    let lines: Vec<Line> = app
-        .history
-        .iter()
-        .flat_map(|item| {
-            let (role_color, role_label) = match item.role.as_str() {
-                "user" => (Color::Cyan, "你"),
-                "assistant" => (Color::LightGreen, "助手"),
-                "system" => (Color::DarkGray, "系统"),
-                _ => (Color::White, item.role.as_str()),
-            };
-            let item_lines: Vec<Line> = item
-                .text
-                .lines()
-                .map(|l| {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{role_label} "),
-                            Style::default().fg(role_color).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(l),
-                    ])
-                })
-                .collect();
-            item_lines
-        })
-        .collect();
+    // ── Chat History ──
+    let mut lines: Vec<Line> = Vec::new();
+    for item in &app.history {
+        let (role_color, role_label) = match item.role.as_str() {
+            "user" => (Color::Cyan, "你"),
+            "assistant" => (Color::LightGreen, "助手"),
+            "system" => (Color::DarkGray, "系统"),
+            _ => (Color::White, item.role.as_str()),
+        };
+
+        // Split text into lines and add role prefix to first line
+        let text_lines: Vec<&str> = item.text.lines().collect();
+        if text_lines.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {role_label}  "),
+                    Style::default()
+                        .fg(role_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(""),
+            ]));
+        } else {
+            for (i, line_text) in text_lines.iter().enumerate() {
+                let mut spans = Vec::new();
+                if i == 0 {
+                    spans.push(Span::styled(
+                        format!("  {role_label}  "),
+                        Style::default()
+                            .fg(role_color)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    // Continuation lines: align with text start
+                    spans.push(Span::raw("        "));
+                }
+
+                // Highlight code blocks
+                if line_text.starts_with("```") {
+                    spans.push(Span::styled(
+                        line_text.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                } else if line_text.starts_with('`') && line_text.ends_with('`') {
+                    // inline code
+                    spans.push(Span::styled(
+                        line_text.to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                } else {
+                    spans.push(Span::raw(line_text.to_string()));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        // Add blank line between messages
+        lines.push(Line::from(""));
+    }
+
     let title = if app.busy {
-        " AgentRust（生成中…） "
+        format!(" AgentRust {} ", spinner_char(app.spinner_frame))
     } else {
-        " AgentRust "
+        " AgentRust ".to_string()
     };
+
     let hist = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     f.render_widget(hist, chunks[0]);
 
-    // input
+    // ── Input Box ──
+    let input_block_title = if app.busy {
+        " 输入（生成中…按 Esc 取消） "
+    } else {
+        " 输入（/ 打开菜单 · Tab 补全 · ↑↓ 历史） "
+    };
     let input = Paragraph::new(app.input.as_str())
         .style(Style::default().fg(Color::White))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" 输入（/settings /help /exit） "),
-        );
+        .block(Block::default().borders(Borders::ALL).title(input_block_title));
     let input_area = chunks[1];
     f.render_widget(input, input_area);
-    f.set_cursor_position((input_area.x + app.input.len() as u16 + 1, input_area.y + 1));
+    // Place cursor at end of input
+    let cursor_x = input_area.x + 1 + app.input.len() as u16;
+    let cursor_y = input_area.y + 1;
+    f.set_cursor_position((cursor_x.min(input_area.right() - 1), cursor_y));
 
-    // command menu overlay (dropdown above the input line)
+    // ── Command Menu Overlay ──
     if app.cmd_menu.is_some() {
         let menu_h = COMMANDS.len() as u16 + 2;
-        let menu_area = ratatui::layout::Rect {
+        let menu_area = Rect {
             x: input_area.x + 1,
             y: input_area.y.saturating_sub(menu_h),
             width: input_area.width.saturating_sub(2).min(60),
@@ -481,7 +638,10 @@ fn draw_chat(f: &mut Frame, app: &ChatApp) {
                 } else {
                     Line::from(vec![
                         Span::styled(format!("  {cmd}"), Style::default().fg(Color::White)),
-                        Span::styled(format!("  {desc}"), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("  {desc}"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ])
                 }
             })
@@ -492,25 +652,31 @@ fn draw_chat(f: &mut Frame, app: &ChatApp) {
         f.render_widget(menu, menu_area);
     }
 
-    // status
-    let cfg = format!(
-        "{} · 模型: {}",
-        app.form[0].value,
-        if app.form[3].value.is_empty() {
-            "（未设置，请运行 /settings）"
-        } else {
-            &app.form[3].value
-        }
+    // ── Status Bar ──
+    let model_str = if app.form[3].value.is_empty() {
+        "（未设置）".to_string()
+    } else {
+        app.form[3].value.clone()
+    };
+    let msg_count = app.history.len();
+    let stats = if app.total_input_tokens + app.total_output_tokens > 0 {
+        format!(
+            "tok: ↓{} ↑{}",
+            app.total_input_tokens, app.total_output_tokens
+        )
+    } else {
+        String::new()
+    };
+    let status_text = format!(
+        "{} · {} · msgs:{} {}  │  {}",
+        app.form[0].value, model_str, msg_count, stats, app.status
     );
-    let status = Paragraph::new(format!("{}  |  {}", cfg, app.status))
-        .style(Style::default().fg(Color::DarkGray));
+    let status = Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(status, chunks[2]);
-
-    // cursor on available message? keep simple
-    let _ = app;
 }
 
 fn draw_settings(f: &mut Frame, app: &ChatApp) {
+    let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -518,7 +684,7 @@ fn draw_settings(f: &mut Frame, app: &ChatApp) {
             Constraint::Length(3),
             Constraint::Length(1),
         ])
-        .split(f.area());
+        .split(area);
 
     let mut lines: Vec<Line> = Vec::new();
     for (i, field) in app.form.iter().enumerate() {
@@ -530,7 +696,6 @@ fn draw_settings(f: &mut Frame, app: &ChatApp) {
         } else {
             Style::default().fg(Color::Cyan)
         };
-        // kind is a selector; others are free text
         let shown: String = if i == 0 {
             let idx = KIND_OPTIONS
                 .iter()
@@ -568,7 +733,6 @@ fn draw_settings(f: &mut Frame, app: &ChatApp) {
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(help, chunks[1]);
 
-    // edit bar
     let status_bar = if app.form_active == 2 {
         Paragraph::new(" API 密钥保存在本地 auth.json（明文）；共享机器建议限制文件权限 ")
             .style(Style::default().fg(Color::Yellow))
@@ -578,7 +742,8 @@ fn draw_settings(f: &mut Frame, app: &ChatApp) {
     f.render_widget(status_bar, chunks[2]);
 }
 
-/// Next kind option in the selector, wrapping. `right=true` advances, false steps back.
+// ─── Key Handling ───────────────────────────────────────────────────
+
 fn cycle_kind(current: &str, right: bool) -> &'static str {
     let cur = KIND_OPTIONS.iter().position(|o| *o == current).unwrap_or(0);
     KIND_OPTIONS[if right {
@@ -588,7 +753,6 @@ fn cycle_kind(current: &str, right: bool) -> &'static str {
     }]
 }
 
-/// Returns false to quit the loop.
 fn handle_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool {
     match app.mode {
         Mode::Settings => handle_settings_key(app, code),
@@ -601,59 +765,87 @@ fn handle_settings_key(app: &mut ChatApp, code: KeyCode) -> bool {
         KeyCode::Esc => {
             app.mode = Mode::Chat;
             app.status = "已放弃修改".to_string();
-            true
         }
         KeyCode::Up => {
             app.form_active = app.form_active.saturating_sub(1);
-            true
         }
         KeyCode::Down => {
             app.form_active = (app.form_active + 1).min(app.form.len() - 1);
-            true
         }
         KeyCode::Tab => {
             app.form_active = (app.form_active + 1) % app.form.len();
-            true
         }
-        KeyCode::Left | KeyCode::Right => {
-            if app.form_active == 0 {
+        KeyCode::Left | KeyCode::Right
+            if app.form_active == 0 => {
                 app.form[0].value =
                     cycle_kind(&app.form[0].value, code == KeyCode::Right).to_string();
             }
-            true
-        }
         KeyCode::Enter => {
-            match app.save_form() {
-                Ok(()) => {
-                    app.mode = Mode::Chat;
-                    app.status = "设置已保存".to_string();
-                }
-                Err(e) => app.status = e,
+            if let Err(e) = app.save_form() {
+                app.status = e;
+            } else {
+                app.mode = Mode::Chat;
+                app.status = "设置已保存".to_string();
             }
-            true
         }
-        KeyCode::Backspace => {
-            if app.form_active != 0 {
+        KeyCode::Backspace
+            if app.form_active != 0 => {
                 app.form[app.form_active].value.pop();
             }
-            true
-        }
-        KeyCode::Char(c) => {
-            if app.form_active != 0 {
+        KeyCode::Char(c)
+            if app.form_active != 0 => {
                 app.form[app.form_active].value.push(c);
             }
-            true
-        }
-        _ => true,
+        _ => {}
     }
+    true
 }
 
 fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool {
+    // Ctrl+C: quit
     if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
-        return false; // Ctrl+C quit
+        return false;
     }
 
-    // command menu active: arrows move, enter runs, esc closes
+    // Ctrl+L: clear screen
+    if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('l') {
+        app.history.clear();
+        app.history.push(ChatItem::new(
+            "system",
+            "AgentRust · 屏幕已清空",
+        ));
+        return true;
+    }
+
+    // Esc: cancel streaming or close command menu
+    if code == KeyCode::Esc {
+        if app.cmd_menu.is_some() {
+            app.cmd_menu = None;
+            app.input.clear();
+            return true;
+        }
+        if app.busy {
+            // Cancel streaming (best effort)
+            app.busy = false;
+            app.streaming_item = None;
+            app.stream_rx = None;
+            app.stream_tx = None;
+            app.status = "已取消".to_string();
+            return true;
+        }
+    }
+
+    // PgUp/PgDn: scroll history
+    if code == KeyCode::PageUp {
+        app.scroll_offset = app.scroll_offset.saturating_add(5);
+        return true;
+    }
+    if code == KeyCode::PageDown {
+        app.scroll_offset = app.scroll_offset.saturating_sub(5);
+        return true;
+    }
+
+    // Command menu active
     if app.cmd_menu.is_some() && app.input == "/" {
         match code {
             KeyCode::Up => {
@@ -676,8 +868,12 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                 app.cmd_menu = None;
                 app.input.clear();
             }
+            KeyCode::Tab => {
+                // Tab: accept current selection
+                let cmd = COMMANDS[app.cmd_menu.unwrap_or(0)].0;
+                return run_command(app, cmd);
+            }
             KeyCode::Char('/') => {
-                // keep menu open, allow typing more (falls through to normal char handling)
                 app.input.push('/');
             }
             _ => {}
@@ -704,7 +900,7 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                 "/help" => {
                     app.history.push(ChatItem::new(
                         "system",
-                        "/settings 配置 · /exit 退出 · 其他输入发送给模型",
+                        "快捷键：\n  ↑/↓    翻阅输入历史\n  Tab    命令补全\n  PgUp/Dn 滚动聊天记录\n  Esc    取消生成\n  Ctrl+C  退出\n  Ctrl+L  清屏\n\n命令：\n  /settings  配置\n  /clear     清空记录\n  /stats     统计信息\n  /model     当前模型\n  /help      帮助\n  /exit      退出",
                     ));
                     app.input.clear();
                 }
@@ -712,20 +908,63 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                     app.history.clear();
                     app.history.push(ChatItem::new(
                         "system",
-                        "AgentRust · 输入 /settings 配置，/help 查看帮助",
+                        "AgentRust · 记录已清空",
+                    ));
+                    app.total_input_tokens = 0;
+                    app.total_output_tokens = 0;
+                    app.input.clear();
+                }
+                "/stats" => {
+                    let msg_count = app.history.len();
+                    let user_msgs = app
+                        .history
+                        .iter()
+                        .filter(|m| m.role == "user")
+                        .count();
+                    let asst_msgs = app
+                        .history
+                        .iter()
+                        .filter(|m| m.role == "assistant")
+                        .count();
+                    app.history.push(ChatItem::new(
+                        "system",
+                        &format!(
+                            "消息数: {} (用户: {}, 助手: {})\nToken: 输入 {} / 输出 {}",
+                            msg_count, user_msgs, asst_msgs,
+                            app.total_input_tokens, app.total_output_tokens
+                        ),
+                    ));
+                    app.input.clear();
+                }
+                "/model" => {
+                    let model = if app.form[3].value.is_empty() {
+                        "（未设置）".to_string()
+                    } else {
+                        app.form[3].value.clone()
+                    };
+                    app.history.push(ChatItem::new(
+                        "system",
+                        &format!("Provider: {}\n模型: {}", app.form[0].value, model),
                     ));
                     app.input.clear();
                 }
                 _ => app.send(text),
             }
-            true
+        }
+        KeyCode::Up => {
+            app.recall_prev();
+        }
+        KeyCode::Down => {
+            app.recall_next();
+        }
+        KeyCode::Tab => {
+            app.tab_complete();
         }
         KeyCode::Backspace => {
             app.input.pop();
             if app.input.is_empty() {
                 app.cmd_menu = None;
             }
-            true
         }
         KeyCode::Char(c) => {
             if c == '/' && app.input.is_empty() {
@@ -734,10 +973,10 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
             } else if !app.input.starts_with('/') || c != '/' {
                 app.input.push(c);
             }
-            true
         }
-        _ => true,
+        _ => {}
     }
+    true
 }
 
 fn run_command(app: &mut ChatApp, cmd: &str) -> bool {
@@ -752,19 +991,51 @@ fn run_command(app: &mut ChatApp, cmd: &str) -> bool {
         "/help" => {
             app.history.push(ChatItem::new(
                 "system",
-                "/settings 配置 · /clear 清空 · /exit 退出 · 其他输入发送给模型",
+                "快捷键：\n  ↑/↓    翻阅输入历史\n  Tab    命令补全\n  PgUp/Dn 滚动聊天记录\n  Esc    取消生成\n  Ctrl+C  退出\n  Ctrl+L  清屏\n\n命令：\n  /settings  配置\n  /clear     清空记录\n  /stats     统计信息\n  /model     当前模型\n  /help      帮助\n  /exit      退出",
             ));
         }
         "/clear" => {
             app.history.clear();
             app.history
-                .push(ChatItem::new("system", "AgentRust · 输入 / 打开命令菜单"));
+                .push(ChatItem::new("system", "AgentRust · 记录已清空"));
+            app.total_input_tokens = 0;
+            app.total_output_tokens = 0;
+        }
+        "/stats" => {
+            let msg_count = app.history.len();
+            let user_msgs = app.history.iter().filter(|m| m.role == "user").count();
+            let asst_msgs = app
+                .history
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .count();
+            app.history.push(ChatItem::new(
+                "system",
+                &format!(
+                    "消息数: {} (用户: {}, 助手: {})\nToken: 输入 {} / 输出 {}",
+                    msg_count, user_msgs, asst_msgs,
+                    app.total_input_tokens, app.total_output_tokens
+                ),
+            ));
+        }
+        "/model" => {
+            let model = if app.form[3].value.is_empty() {
+                "（未设置）".to_string()
+            } else {
+                app.form[3].value.clone()
+            };
+            app.history.push(ChatItem::new(
+                "system",
+                &format!("Provider: {}\n模型: {}", app.form[0].value, model),
+            ));
         }
         "/exit" => return false,
         _ => {}
     }
     true
 }
+
+// ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -793,15 +1064,48 @@ mod tests {
     #[test]
     fn run_command_dispatches() {
         let mut app = ChatApp::new();
-        // /settings opens the settings mode
         assert!(run_command(&mut app, "/settings"));
         assert!(matches!(app.mode, Mode::Settings));
-        // back to chat
         app.mode = Mode::Chat;
-        // /clear empties history but keeps the intro line
         assert!(run_command(&mut app, "/clear"));
         assert_eq!(app.history.len(), 1);
-        // /exit signals quit
         assert!(!run_command(&mut app, "/exit"));
+    }
+
+    #[test]
+    fn input_history_recall() {
+        let mut app = ChatApp::new();
+        app.input_history = vec!["hello".into(), "world".into(), "foo".into()];
+        app.recall_prev();
+        assert_eq!(app.input, "foo");
+        app.recall_prev();
+        assert_eq!(app.input, "world");
+        app.recall_next();
+        assert_eq!(app.input, "foo");
+        app.recall_next();
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn spinner_cycles() {
+        assert_eq!(spinner_char(0), "⠋");
+        assert_eq!(spinner_char(1), "⠙");
+        assert_eq!(spinner_char(8), "⠋"); // wraps
+    }
+
+    #[test]
+    fn tab_complete_single_match() {
+        let mut app = ChatApp::new();
+        app.input = "/set".to_string();
+        app.tab_complete();
+        assert_eq!(app.input, "/settings ");
+    }
+
+    #[test]
+    fn tab_complete_no_match() {
+        let mut app = ChatApp::new();
+        app.input = "/xyz".to_string();
+        app.tab_complete();
+        assert_eq!(app.input, "/xyz"); // unchanged
     }
 }

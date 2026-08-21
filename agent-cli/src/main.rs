@@ -11,30 +11,30 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "agent",
     version,
-    about = "high-performance coding agent (DESIGN.md)"
+    about = "高性能编程智能体"
 )]
 struct Cli {
     /// run mode; empty = interactive TUI (double-click friendly)
     #[command(subcommand)]
     mode: Option<Mode>,
 
-    /// working directory for the session
+    /// 会话的工作目录
     #[arg(long, global = true, default_value = ".")]
     cwd: String,
 
-    /// provider kind override for headless modes (TUI uses auth.json)
+    /// 无头模式的服务商类型覆盖（TUI 使用 auth.json）
     #[arg(long, global = true, default_value = "")]
     provider: String,
 
-    /// model id override for headless modes
+    /// 无头模式的模型 ID 覆盖
     #[arg(long, global = true)]
     model: Option<String>,
 
-    /// override provider base URL (e.g. local mock server)
+    /// 服务商基础 URL 覆盖（例如本地模拟服务器）
     #[arg(long, global = true)]
     base_url: Option<String>,
 
-    /// API key override; otherwise auth.json then env var
+    /// API 密钥覆盖；否则使用 auth.json 然后环境变量
     #[arg(long, global = true)]
     api_key: Option<String>,
 }

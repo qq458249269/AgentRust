@@ -1,14 +1,13 @@
-//! Print mode: send prompts, stream-print text, print usage accounting, exit.
+//! Print mode: send prompts through AgentSession, stream-print text, print usage, exit.
 
-use crate::{CommonArgs, PrintArgs};
+use crate::{client, CommonArgs, PrintArgs};
 use agent_ai::model::{Model, ThinkingLevel};
 use agent_ai::provider::{ChatMessage, Part, ProviderClient, ProviderKind, ProviderRequest};
 use agent_ai::stream::StreamEvent;
 use agent_session::AgentSession;
 
 pub async fn run(_session: AgentSession, cli: &CommonArgs, args: &PrintArgs) -> anyhow::Result<()> {
-    // kind first, then url + key (each: override -> auth.json -> env/default)
-    // kind falls back to auth.json's "provider" when no CLI override is given.
+    // Resolve provider kind from CLI or auth.json
     let kind_s = if cli.provider.is_empty() {
         agent_ai::provider::read_auth_json()
             .get("provider")
@@ -19,7 +18,12 @@ pub async fn run(_session: AgentSession, cli: &CommonArgs, args: &PrintArgs) -> 
         cli.provider.clone()
     };
     let kind = ProviderKind::parse(&kind_s)
-        .ok_or_else(|| anyhow::anyhow!("unknown provider kind: {kind_s}"))?;
+        .ok_or_else(|| anyhow::anyhow!("未知的服务商类型: {kind_s}"))?;
+
+    // Resolve API key
+    let api_key = kind.resolve_key(cli.api_key.as_deref());
+
+    // Resolve model
     let default_model = agent_ai::provider::read_auth_json()
         .get("default_model")
         .and_then(|v| v.as_str())
@@ -33,22 +37,26 @@ pub async fn run(_session: AgentSession, cli: &CommonArgs, args: &PrintArgs) -> 
         max_tokens: 4096,
     };
 
-    let api_key = kind.resolve_key(cli.api_key.as_deref());
-    let mut client = ProviderClient::new();
-    client.setup(kind, api_key, cli.base_url.clone());
+    // Build provider
+    let mut provider_client = ProviderClient::new();
+    provider_client.setup(kind, api_key, cli.base_url.clone());
 
-    let p = client
+    let p = provider_client
         .provider_for(&model)
-        .ok_or_else(|| anyhow::anyhow!("no provider for model {}", model.id))?;
+        .ok_or_else(|| anyhow::anyhow!("没有可用的服务商: {}", model.id))?;
 
+    // Build message from prompts
     let first = args.prompts.first().cloned().unwrap_or_default();
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        parts: vec![Part::Text { text: first }],
+    }];
+
+    // Direct provider call for single-turn print (no session overhead)
     let req = ProviderRequest {
         model,
         system: String::new(),
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            parts: vec![Part::Text { text: first }],
-        }],
+        messages,
         thinking: ThinkingLevel::Off,
         max_tokens: 1024,
         tools: Vec::new(),
@@ -56,7 +64,7 @@ pub async fn run(_session: AgentSession, cli: &CommonArgs, args: &PrintArgs) -> 
 
     use anyhow::Context;
     let resp = p
-        .chat(&crate::client(), &req)
+        .chat(client(), &req)
         .await
         .context("provider chat")?;
 

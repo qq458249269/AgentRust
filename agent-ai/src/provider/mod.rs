@@ -399,7 +399,7 @@ impl ProviderKind {
         }
         let trimmed = base.trim_end_matches('/');
         if trimmed.is_empty() {
-            return format!("{}", self.default_base_url());
+            return self.default_base_url().to_string();
         }
         format!("{trimmed}{path}")
     }

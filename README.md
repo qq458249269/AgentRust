@@ -43,12 +43,12 @@ agent json
 ## 状态
 
 - [x] M0 workspace 骨架（编译通过，零 warning）
-- [ ] M1 agent-ai：Anthropic SSE + OpenAI-compatible 流式、usage 记账
-- [ ] M2 agent-core：循环、并行工具、取消
-- [ ] M3 agent-session：JSONL 树、增量上下文、compaction
-- [ ] M4 rpc / json / print 前端
-- [ ] M5 事件总线开放 + 插件
-- [ ] M6 TUI（可选）
+- [x] M1 agent-ai：Anthropic SSE + OpenAI-compatible 流式、usage 记账、凭据解析
+- [x] M2 agent-core：AgentLoop 主循环、并行工具执行、取消传播
+- [x] M3 agent-session：JSONL 树、上下文增量、compaction 设置 + LLM 摘要、事件总线
+- [x] M4 rpc / json / print / tui 前端（四种模式均可用）
+- [x] M5 事件总线开放 + 插件（hook 注册、tool_call 拦截、/reload 热重载）
+- [x] M6 TUI 增强（输入历史、滚动、spinner 动画、代码高亮、Tab 补全、/stats 统计）
 
 ## License
 

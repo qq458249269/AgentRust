@@ -2,12 +2,14 @@
 
 pub mod cancel;
 pub mod error;
+pub mod loop_; // loop_ because `loop` is a keyword
 pub mod messages;
 pub mod state;
 pub mod tools;
 
 pub use cancel::Cancelled;
 pub use error::CoreError;
+pub use loop_::{run_loop, LoopConfig, LoopResult};
 pub use messages::{AssistantMessage, Message, Role, ToolResultMessage, UserMessage};
 pub use state::AgentState;
 pub use tools::{Tool, ToolArgs, ToolExecution, ToolOutput, ToolRegistry};
