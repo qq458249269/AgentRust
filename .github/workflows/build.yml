@@ -89,10 +89,10 @@ jobs:
           path: artifacts
           pattern: agent-windows-x86_64-*
 
-      - name: 创建 GitHub Release
+      - name: 创建 GitHub Pre-release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*.exe
           generate_release_notes: true
           draft: false
-          prerelease: false
+          prerelease: true
