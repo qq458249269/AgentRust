@@ -305,6 +305,7 @@ impl ChatApp {
 
         tokio::spawn(async move {
             let root = read_auth_json();
+            tracing::info!("TUI 发送任务启动");
             let kind_s = root
                 .get("provider")
                 .and_then(|v| v.as_str())
@@ -347,6 +348,7 @@ impl ChatApp {
                     return;
                 }
             };
+            tracing::info!("请求: provider={}", kind_s);
             let req = ProviderRequest {
                 model,
                 system: String::new(),
@@ -359,20 +361,27 @@ impl ChatApp {
                 tools: Vec::new(),
             };
             let resp = match provider.chat(client(), &req).await {
-                Ok(r) => r,
+                Ok(r) => {
+                    tracing::info!("收到 HTTP 响应");
+                    r
+                }
                 Err(e) => {
+                    tracing::error!("请求失败: {e}");
                     let _ = tx.send(StreamMsg::Err(format!("{e}")));
                     return;
                 }
             };
             match resp {
                 agent_ai::provider::ProviderResponse::Stream(mut sr) => {
+                    tracing::info!("开始接收流式响应");
                     while let Some(ev) = sr.next().await {
                         match ev {
                             Ok(agent_ai::stream::StreamEvent::TextDelta { delta }) => {
+                                tracing::trace!("收到 Delta: {} 字节", delta.len());
                                 let _ = tx.send(StreamMsg::Delta(delta));
                             }
                             Ok(agent_ai::stream::StreamEvent::Usage { usage }) => {
+                                tracing::info!("收到 Usage: in={} out={}", usage.input, usage.output);
                                 let _ = tx.send(StreamMsg::Done(format!(
                                     "用量：输入={} 输出={} 缓存读={} 缓存写={} 总计={}",
                                     usage.input,
@@ -383,16 +392,20 @@ impl ChatApp {
                                 )));
                             }
                             Ok(agent_ai::stream::StreamEvent::Done { stop_reason }) => {
+                                tracing::info!("收到 Done: {stop_reason:?}");
                                 let _ = tx.send(StreamMsg::Done(format!("结束：{stop_reason:?}")));
                             }
                             Err(e) => {
+                                tracing::error!("流错误: {e}");
                                 let _ = tx.send(StreamMsg::Err(format!("{e}")));
                             }
                             _ => {}
                         }
                     }
+                    tracing::info!("流式响应接收完毕");
                 }
                 agent_ai::provider::ProviderResponse::Done { text, usage, .. } => {
+                    tracing::info!("收到一次性响应: {} 字节", text.len());
                     let _ = tx.send(StreamMsg::Delta(text));
                     let _ = tx.send(StreamMsg::Done(format!(
                         "用量：输入={} 输出={}",
@@ -400,6 +413,7 @@ impl ChatApp {
                     )));
                 }
             }
+            tracing::info!("TUI 发送任务结束");
         });
     }
 }
@@ -425,6 +439,7 @@ async fn run_loop(
         if let Some(rx) = &app.stream_rx {
             let mut finished = false;
             while let Ok(msg) = rx.try_recv() {
+                tracing::trace!("收到消息: {:?}", std::mem::discriminant(&msg));
                 match msg {
                     StreamMsg::Delta(d) => {
                         if let Some(idx) = app.streaming_item {

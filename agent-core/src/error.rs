@@ -10,6 +10,10 @@ pub enum CoreError {
     InvalidToolCall { name: String, message: String },
     #[error("已取消")]
     Cancelled,
-    #[error("上下文溢出，需要压缩")]
-    ContextOverflow { needed: usize, available: usize },
+    #[error("上下文溢出，需要压缩（已用 {used} token，窗口 {window}，保留 {reserve}）")]
+    ContextOverflow {
+        used: u64,
+        window: u64,
+        reserve: u64,
+    },
 }

@@ -9,7 +9,7 @@ use crate::journal::Journal;
 use agent_ai::model::Model;
 use agent_ai::provider::ToolSpec;
 
-use agent_core::loop_::{run_loop, LoopConfig};
+use agent_core::loop_::{estimate_tokens, estimate_message_tokens, run_loop, LoopConfig};
 use agent_core::messages::{ContentBlock, Message, MessageContent, Role};
 use agent_core::state::AgentState;
 use agent_core::tools::ToolRegistry;
@@ -129,7 +129,7 @@ impl AgentSession {
         });
 
         // 2. Build messages for the agent loop
-        let provider = self
+        let _provider = self
             .provider
             .as_ref()
             .ok_or_else(|| SessionError::Core(agent_core::CoreError::Tool("未配置服务商".into())))?;
@@ -178,9 +178,12 @@ impl AgentSession {
         }
         self.bus.emit(Event::AgentStart);
 
-        // 4. Call agent loop
+        // 4. Call agent loop with overflow recovery
         self.phase = crate::Phase::Streaming;
         self.cancel = Cancelled::new();
+
+        // Clone provider Arc to avoid borrow issues in the loop
+        let provider_arc = self.provider.clone().unwrap();
 
         // Run tool_call interceptors: register a wrapper tool registry that applies hooks
         let hook_registry = if self.has_tool_hooks().await {
@@ -189,25 +192,65 @@ impl AgentSession {
         } else {
             None
         };
-        let effective_registry = hook_registry.as_ref().unwrap_or(&self.tool_registry);
+        let effective_registry = hook_registry.as_ref().unwrap_or(&self.tool_registry).clone();
 
-        let loop_result = run_loop(
-            provider.as_ref(),
-            &self.client,
-            effective_registry,
-            &self.cancel,
-            LoopConfig {
-                model: &model,
-                system: &self.system_prompt,
-                messages: &messages,
-                tools: &tool_specs,
-                max_tokens: model.max_tokens,
-                thinking: self.state.thinking_level,
-                max_turns: 10,
-            },
-        )
-        .await
-        .map_err(SessionError::Core)?;
+        // pi parity: overflow → compact → retry. Max 1 retry to prevent infinite loop.
+        let mut current_messages = messages.clone();
+        let mut compacted = false;
+        let loop_result = loop {
+            match run_loop(
+                provider_arc.as_ref(),
+                &self.client,
+                &effective_registry,
+                &self.cancel,
+                LoopConfig {
+                    model: &model,
+                    system: &self.system_prompt,
+                    messages: &current_messages,
+                    tools: &tool_specs,
+                    max_tokens: model.max_tokens,
+                    thinking: self.state.thinking_level,
+                    max_turns: 10,
+                    context_window: model.context_window as u64,
+                    reserve_tokens: self.compaction_settings.reserve_tokens,
+                },
+            )
+            .await
+            {
+                Ok(result) => break Ok(result),
+                Err(agent_core::CoreError::ContextOverflow { used, window, reserve }) => {
+                    if compacted {
+                        // Already compacted once, don't retry again
+                        tracing::warn!(
+                            "压缩后仍然溢出 (used={}, window={}, reserve={}), 放弃重试",
+                            used, window, reserve
+                        );
+                        break Err(SessionError::Core(agent_core::CoreError::ContextOverflow { used, window, reserve }));
+                    }
+                    tracing::info!(
+                        "上下文溢出 ({} token), 触发压缩后重试",
+                        used
+                    );
+                    // Trigger compaction
+                    match self.compact_context(&current_messages, &model, provider_arc.as_ref()).await {
+                        Ok(new_messages) => {
+                            current_messages = new_messages;
+                            compacted = true;
+                            self.invalidate_context();
+                            self.bus.emit(Event::CompactionStart {
+                                reason: crate::bus::CompactionReason::Overflow,
+                            });
+                            continue; // retry with compacted context
+                        }
+                        Err(e) => {
+                            tracing::error!("压缩失败: {e}");
+                            break Err(e);
+                        }
+                    }
+                }
+                Err(e) => break Err(SessionError::Core(e)),
+            }
+        }?;
 
         // 5. Write results to journal
         let mut final_text = String::new();
@@ -256,6 +299,125 @@ impl AgentSession {
         self.phase = crate::Phase::Idle;
 
         Ok(final_text)
+    }
+
+    // ─── Compaction (auto-compress on overflow) ───────────────────
+
+    /// Compact context when overflow detected. pi parity:
+    /// - keepRecentTokens from the tail are preserved uncompressed
+    /// - older messages are summarized via LLM
+    /// - summary is written as a Compaction entry in the journal
+    /// - prefix (system + tools) is NOT touched → prompt cache stays warm
+    async fn compact_context(
+        &mut self,
+        messages: &[Message],
+        model: &Model,
+        provider: &dyn agent_ai::provider::ChatProvider,
+    ) -> Result<Vec<Message>, SessionError> {
+        // Count recent tokens to determine the cut point
+        let keep_tokens = self.compaction_settings.keep_recent_tokens;
+        let mut tail_tokens: u64 = 0;
+        let mut cut_idx = messages.len();
+        for (i, msg) in messages.iter().enumerate().rev() {
+            let msg_tokens = estimate_message_tokens(msg);
+            if tail_tokens + msg_tokens > keep_tokens {
+                cut_idx = i + 1;
+                break;
+            }
+            tail_tokens += msg_tokens;
+        }
+        // Don't cut in the middle of a tool call/result pair
+        while cut_idx > 0 {
+            match &messages[cut_idx - 1].role {
+                Role::User | Role::Assistant => break,
+                Role::ToolResult => cut_idx -= 1,
+            }
+        }
+        if cut_idx == 0 || cut_idx >= messages.len() {
+            // Nothing to compact
+            return Ok(messages.to_vec());
+        }
+
+        let (to_summarize, retained) = messages.split_at(cut_idx);
+        let tokens_before = estimate_tokens(&self.system_prompt)
+            + to_summarize.iter().map(estimate_message_tokens).sum::<u64>();
+
+        // Serialize older messages for summarization
+        let serialized = serialize_for_summary(to_summarize);
+
+        // Call LLM for summary (pi: independent request, no cache write)
+        let summary_prompt = format!(
+            "请简洁地总结以下对话历史。\
+             保留关键事实、决策、文件路径和后续对话需要的上下文。\
+             只输出摘要，不要前言。\n\n{serialized}"
+        );
+        let req = agent_ai::provider::ProviderRequest {
+            model: model.clone(),
+            system: "你是一个对话总结器。请简洁地总结对话历史，\
+                      保留关键事实、决策、文件路径和重要上下文。"
+                .to_string(),
+            messages: vec![agent_ai::provider::ChatMessage {
+                role: "user".into(),
+                parts: vec![agent_ai::provider::Part::Text {
+                    text: summary_prompt,
+                }],
+            }],
+            thinking: agent_ai::model::ThinkingLevel::Off,
+            max_tokens: 2048,
+            tools: Vec::new(),
+        };
+        let resp = provider.chat(&self.client, &req).await.map_err(SessionError::Ai)?;
+        let summary = match resp {
+            agent_ai::provider::ProviderResponse::Stream(mut sr) => {
+                let mut text = String::new();
+                while let Some(ev) = sr.next().await {
+                    match ev.map_err(SessionError::Ai)? {
+                        agent_ai::stream::StreamEvent::TextDelta { delta } => text.push_str(&delta),
+                        agent_ai::stream::StreamEvent::Done { .. } => break,
+                        _ => {}
+                    }
+                }
+                text
+            }
+            agent_ai::provider::ProviderResponse::Done { text, .. } => text,
+        };
+
+        // Write Compaction entry to journal (self-contained checkpoint)
+        let compaction_id = uuid_str();
+        let compaction_entry = Entry::Compaction {
+            id: compaction_id,
+            parent_id: self.journal.leaf.clone(),
+            timestamp: now_iso(),
+            summary: summary.clone(),
+            first_kept_entry_id: retained.first().map(|m| m.id.clone()),
+            tokens_before,
+            retained_tail: None,
+            details: None,
+        };
+        self.journal.append(compaction_entry);
+
+        // Build new message list: [summary as assistant message] + [retained messages]
+        let summary_msg = Message {
+            id: uuid_str(),
+            role: Role::Assistant,
+            content: MessageContent::Text(format!("[会话摘要] {summary}")),
+            usage: None,
+            stop_reason: None,
+            timestamp: now_ts(),
+            provider: None,
+            model: None,
+        };
+        let mut new_messages = vec![summary_msg];
+        new_messages.extend_from_slice(retained);
+
+        tracing::info!(
+            "压缩完成: {} 条消息 → 摘要 + {} 条保留 (tokens_before={})",
+            cut_idx,
+            retained.len(),
+            tokens_before
+        );
+
+        Ok(new_messages)
     }
 
     // ─── M5 Plugin API ───────────────────────────────────────────
@@ -369,4 +531,37 @@ fn rand_u32() -> u32 {
             .as_nanos() as u64,
     );
     h.finish() as u32
+}
+
+/// Serialize messages to text for LLM summarization (for compaction).
+fn serialize_for_summary(messages: &[Message]) -> String {
+    let mut parts = Vec::new();
+    for msg in messages {
+        let role_str = match msg.role {
+            agent_core::messages::Role::User => "用户",
+            agent_core::messages::Role::Assistant => "助手",
+            agent_core::messages::Role::ToolResult => "工具结果",
+        };
+        let content = match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Assistant(blocks) => {
+                let mut s = String::new();
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text(t) => s.push_str(t),
+                        ContentBlock::Thinking(t) => s.push_str(&format!("[思考: {t}]")),
+                        ContentBlock::ToolCall { name, arguments, .. } => {
+                            s.push_str(&format!("[工具调用: {name}({arguments})]"));
+                        }
+                    }
+                }
+                s
+            }
+            MessageContent::Image { mime, data } => {
+                format!("[图片: {mime}, {} 字节]", data.len())
+            }
+        };
+        parts.push(format!("[{role_str}]: {content}"));
+    }
+    parts.join("\n\n")
 }

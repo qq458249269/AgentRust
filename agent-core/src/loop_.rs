@@ -44,6 +44,34 @@ pub struct LoopConfig<'a> {
     pub thinking: agent_ai::model::ThinkingLevel,
     /// Maximum number of tool-use turns before forced stop (prevents infinite loops).
     pub max_turns: u32,
+    /// Context window size (from model). 0 = no overflow check.
+    pub context_window: u64,
+    /// Reserve tokens below the window that triggers compaction.
+    pub reserve_tokens: u64,
+}
+
+/// Rough token estimation: ~4 chars per token for English, ~2 for CJK.
+pub fn estimate_tokens(text: &str) -> u64 {
+    let chars = text.len() as u64;
+    // Rough heuristic: 4 chars per token (works for English-heavy text)
+    chars / 4
+}
+
+/// Estimate tokens for a single message.
+pub fn estimate_message_tokens(msg: &Message) -> u64 {
+    let content_chars: usize = match &msg.content {
+        MessageContent::Text(t) => t.len(),
+        MessageContent::Assistant(blocks) => blocks
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text(t) => t.len(),
+                ContentBlock::Thinking(t) => t.len(),
+                ContentBlock::ToolCall { arguments, .. } => arguments.len(),
+            })
+            .sum(),
+        MessageContent::Image { .. } => 100,
+    };
+    (content_chars as u64) / 4 + 4 // +4 for role/formatting overhead
 }
 
 /// Run the agent loop: stream from provider, execute tools, loop until non-tool stop.
@@ -79,7 +107,29 @@ pub async fn run_loop(
             });
         }
 
-        // 1. Build ProviderRequest from messages
+        // 1. Estimate current context tokens and check for overflow
+        if config.context_window > 0 {
+            let system_tokens = estimate_tokens(config.system);
+            let tool_tokens: u64 = config.tools.iter().map(|t| {
+                estimate_tokens(&t.name) + estimate_tokens(&t.description)
+            }).sum();
+            let msg_tokens: u64 = messages.iter().map(estimate_message_tokens).sum();
+            let total = system_tokens + tool_tokens + msg_tokens;
+            if total > config.context_window.saturating_sub(config.reserve_tokens) {
+                tracing::warn!(
+                    "上下文溢出: {} token > {} (窗口 {}, 保留 {})",
+                    total, config.context_window - config.reserve_tokens,
+                    config.context_window, config.reserve_tokens
+                );
+                return Err(CoreError::ContextOverflow {
+                    used: total,
+                    window: config.context_window,
+                    reserve: config.reserve_tokens,
+                });
+            }
+        }
+
+        // 2. Build ProviderRequest from messages
         let provider_msgs = convert_messages_for_provider(&messages);
         let req = ProviderRequest {
             model: config.model.clone(),
@@ -90,10 +140,10 @@ pub async fn run_loop(
             tools: config.tools.to_vec(),
         };
 
-        // 2. Call provider
+        // 3. Call provider
         let resp = provider.chat(client, &req).await?;
 
-        // 3. Stream response, accumulate text + tool calls
+        // 4. Stream response, accumulate text + tool calls
         let (stream_text, stream_thinking, tool_calls, final_usage, stop_reason) =
             match resp {
                 ProviderResponse::Stream(mut sr) => {
@@ -158,10 +208,10 @@ pub async fn run_loop(
                 } => (text, thinking, Vec::new(), usage, StopReason::Stop),
             };
 
-        // 4. Accumulate usage
+        // 5. Accumulate usage
         accumulated_usage.accumulate(&final_usage);
 
-        // 5. Build assistant message content blocks
+        // 6. Build assistant message content blocks
         let mut blocks: Vec<ContentBlock> = Vec::new();
         if !stream_thinking.is_empty() {
             blocks.push(ContentBlock::Thinking(stream_thinking));
@@ -190,7 +240,7 @@ pub async fn run_loop(
         };
         messages.push(assistant_msg);
 
-        // 6. If not tool_use, we're done
+        // 7. If not tool_use, we're done
         if stop_reason != StopReason::ToolUse || tool_calls.is_empty() {
             return Ok(LoopResult {
                 messages,
@@ -199,7 +249,7 @@ pub async fn run_loop(
             });
         }
 
-        // 7. Execute tools in parallel
+        // 8. Execute tools in parallel
         let tool_args: Vec<ToolArgs> = tool_calls
             .iter()
             .map(|tc| {
@@ -215,7 +265,7 @@ pub async fn run_loop(
 
         let results = registry.run_all(&tool_args, cancel).await;
 
-        // 8. Add tool results as user messages (one per tool call, source order)
+        // 9. Add tool results as user messages (one per tool call, source order)
         for (_tc, result) in tool_calls.iter().zip(results) {
             let output = match result {
                 Ok(o) => o,
@@ -409,12 +459,14 @@ mod tests {
             &cancel,
             LoopConfig {
                 model: &model,
-                system: "You are a test".into(),
+                system: "You are a test",
                 messages: &[],
                 tools: &[],
                 max_tokens: 100,
                 thinking: agent_ai::model::ThinkingLevel::Off,
                 max_turns: 5,
+                context_window: 10000,
+                reserve_tokens: 1000,
             },
         )
         .await

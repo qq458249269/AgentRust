@@ -3,7 +3,7 @@ resolver = "2"
 members = ["agent-ai", "agent-core", "agent-session", "agent-cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.20260821.1"
 edition = "2021"
 license = "MIT"
 

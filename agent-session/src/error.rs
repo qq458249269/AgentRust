@@ -8,6 +8,8 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
     #[error("核心错误: {0}")]
     Core(#[from] agent_core::CoreError),
+    #[error("AI 错误: {0}")]
+    Ai(#[from] agent_ai::AiError),
     #[error("会话文件损坏，第 {line} 行: {message}")]
     Corrupt { line: usize, message: String },
 }

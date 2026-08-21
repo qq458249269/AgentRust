@@ -227,12 +227,12 @@ mod tests {
                 break;
             }
             let end = (pos + size).min(sse.len());
-            s.push(Bytes::copy_from_slice(sse[pos..end].as_bytes()))
+            s.push(Bytes::copy_from_slice(&sse.as_bytes()[pos..end]))
                 .expect("push");
             pos = end;
         }
         if pos < sse.len() {
-            s.push(Bytes::copy_from_slice(sse[pos..].as_bytes()))
+            s.push(Bytes::copy_from_slice(&sse.as_bytes()[pos..]))
                 .expect("push");
         }
         s.finish().expect("finish");
@@ -243,7 +243,7 @@ mod tests {
             got.push(item.expect("payload"));
         }
         assert_eq!(got.len(), 3, "{got:?}");
-        assert!(got.iter().all(|l| l == &"{\"type\":\"a\"}"));
+        assert!(got.iter().all(|l| l == "{\"type\":\"a\"}"));
     }
 
     /// Multi-line data payloads are joined with a single \n.

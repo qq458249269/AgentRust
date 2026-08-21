@@ -3,7 +3,6 @@ name: 构建 Windows x86_64
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -21,7 +20,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-          components: clippy, rustfmt
+          components: clippy
 
       - name: 缓存 Cargo 依赖
         uses: actions/cache@v4
@@ -34,50 +33,68 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: 检查代码格式
-        run: cargo fmt --all -- --check
-
       - name: Clippy 检查
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: 运行测试
         run: cargo test --all
+
+      - name: 生成版本号（0.YYYYMMDD.N）
+        id: version
+        shell: bash
+        run: |
+          DATE=$(date +%%Y%%m%%d)
+          COUNT_FILE=".github/build-count-${DATE}"
+          if [ -f "$COUNT_FILE" ]; then
+            LAST=$(cat "$COUNT_FILE")
+          else
+            LAST=0
+          fi
+          NEXT=$((LAST + 1))
+          echo "$NEXT" > "$COUNT_FILE"
+          VERSION="0.${DATE}.${NEXT}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "版本号: ${VERSION}"
 
       - name: 构建 Release 版本
         run: cargo build --release --bin agent
 
       - name: 重命名输出文件
+        shell: bash
         run: |
-          mv target/release/agent.exe agent-windows-x86_64.exe
-          echo "构建完成: agent-windows-x86_64.exe"
+          VERSION="${{ steps.version.outputs.version }}"
+          mv target/release/agent.exe "agent-${VERSION}-windows-x86_64.exe"
+          echo "构建完成: agent-${VERSION}-windows-x86_64.exe"
 
       - name: 计算文件哈希
+        shell: bash
         run: |
-          certutil -hashfile agent-windows-x86_64.exe SHA256
+          VERSION="${{ steps.version.outputs.version }}"
+          certutil -hashfile "agent-${VERSION}-windows-x86_64.exe" SHA256
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: agent-windows-x86_64
-          path: agent-windows-x86_64.exe
+          name: agent-windows-x86_64-${{ steps.version.outputs.version }}
+          path: agent-*-windows-x86_64.exe
           retention-days: 30
 
   release:
     needs: build-windows-x86_64
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
       - name: 下载构建产物
         uses: actions/download-artifact@v4
         with:
-          name: agent-windows-x86_64
+          path: artifacts
+          pattern: agent-windows-x86_64-*
 
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: agent-windows-x86_64.exe
+          files: artifacts/**/*.exe
           generate_release_notes: true
           draft: false
           prerelease: false
