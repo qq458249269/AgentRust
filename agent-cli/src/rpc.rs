@@ -187,7 +187,7 @@ pub async fn run(_session: AgentSession, cli: &CommonArgs) -> anyhow::Result<()>
                                     stdout.write_all(b"\n").await?;
                                 }
                             }
-                            agent_ai::provider::ProviderResponse::Done { text, usage: _, .. } => {
+                            agent_ai::provider::ProviderResponse::Done { text, .. } => {
                                 messages.push(ChatMessage {
                                     role: "assistant".into(),
                                     parts: vec![Part::Text { text }],

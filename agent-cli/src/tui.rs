@@ -315,7 +315,7 @@ impl ChatApp {
                 .and_then(|v| v.as_str())
                 .unwrap_or("openai chat");
             let Some(kind) = ProviderKind::parse(kind_s) else {
-                let _ = tx.send(StreamMsg::Err(
+                let _ = tx.try_send(StreamMsg::Err(
                     "没有配置有效的 provider；请执行 /settings 设置".into(),
                 ));
                 return;
@@ -348,7 +348,7 @@ impl ChatApp {
             let provider = match pc.provider_for(&model) {
                 Some(p) => p,
                 None => {
-                    let _ = tx.send(StreamMsg::Err(format!("没有可用的 provider：{}", model.id)));
+                    let _ = tx.try_send(StreamMsg::Err(format!("没有可用的 provider：{}", model.id)));
                     return;
                 }
             };
@@ -371,7 +371,7 @@ impl ChatApp {
                 }
                 Err(e) => {
                     tracing::error!("请求失败: {e}");
-                    let _ = tx.send(StreamMsg::Err(format!("{e}")));
+                    let _ = tx.try_send(StreamMsg::Err(format!("{e}")));
                     return;
                 }
             };
@@ -382,11 +382,11 @@ impl ChatApp {
                         match ev {
                             Ok(agent_ai::stream::StreamEvent::TextDelta { delta }) => {
                                 tracing::trace!("收到 Delta: {} 字节", delta.len());
-                                let _ = tx.send(StreamMsg::Delta(delta));
+                                let _ = tx.try_send(StreamMsg::Delta(delta));
                             }
                             Ok(agent_ai::stream::StreamEvent::Usage { usage }) => {
                                 tracing::info!("收到 Usage: in={} out={}", usage.input, usage.output);
-                                let _ = tx.send(StreamMsg::Done(format!(
+                                let _ = tx.try_send(StreamMsg::Done(format!(
                                     "用量：输入={} 输出={} 缓存读={} 缓存写={} 总计={}",
                                     usage.input,
                                     usage.output,
@@ -397,11 +397,11 @@ impl ChatApp {
                             }
                             Ok(agent_ai::stream::StreamEvent::Done { stop_reason }) => {
                                 tracing::info!("收到 Done: {stop_reason:?}");
-                                let _ = tx.send(StreamMsg::Done(format!("结束：{stop_reason:?}")));
+                                let _ = tx.try_send(StreamMsg::Done(format!("结束：{stop_reason:?}")));
                             }
                             Err(e) => {
                                 tracing::error!("流错误: {e}");
-                                let _ = tx.send(StreamMsg::Err(format!("{e}")));
+                                let _ = tx.try_send(StreamMsg::Err(format!("{e}")));
                             }
                             _ => {}
                         }
@@ -410,8 +410,8 @@ impl ChatApp {
                 }
                 agent_ai::provider::ProviderResponse::Done { text, usage, .. } => {
                     tracing::info!("收到一次性响应: {} 字节", text.len());
-                    let _ = tx.send(StreamMsg::Delta(text));
-                    let _ = tx.send(StreamMsg::Done(format!(
+                    let _ = tx.try_send(StreamMsg::Delta(text));
+                    let _ = tx.try_send(StreamMsg::Done(format!(
                         "用量：输入={} 输出={}",
                         usage.input, usage.output
                     )));
