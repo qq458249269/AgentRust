@@ -39,26 +39,30 @@ impl ChatItem {
     }
 }
 
-/// Settings form field (kind, base_url, api_key, model id).
+/// Settings form field (类型, 接口地址, API 密钥, 模型 ID).
 struct FormField {
     label: &'static str,
     value: String,
     hint: String,
 }
 
-const FIELD_LABELS: [(&str, &str); 4] = [
+const KIND_OPTIONS: [&str; 4] = [
+    "anthropic messages",
+    "openai chat",
+    "openai responses",
+    "deepseek chat",
+];
+
+const FORM_LABELS: [(&str, &str); 4] = [
+    ("类型", "← → 切换类型"),
     (
-        "kind",
-        "anthropic messages | openai chat | openai responses | deepseek chat",
+        "接口地址",
+        "留空用默认地址，例如 https://api.anthropic.com/v1/messages",
     ),
+    ("API 密钥", "留空则尝试环境变量"),
     (
-        "base url",
-        "leave empty for provider default; e.g. https://api.anthropic.com/v1/messages",
-    ),
-    ("api key", "leave empty to fall back to env var"),
-    (
-        "model id",
-        "e.g. claude-sonnet-4-5, gpt-4o-mini, deepseek-chat",
+        "模型 ID",
+        "例如 claude-sonnet-4-5, gpt-4o-mini, deepseek-chat",
     ),
 ];
 
@@ -89,7 +93,7 @@ enum StreamMsg {
 
 impl ChatApp {
     fn new() -> Self {
-        let form: Vec<FormField> = FIELD_LABELS
+        let form: Vec<FormField> = FORM_LABELS
             .into_iter()
             .map(|(label, hint)| FormField {
                 label,
@@ -101,7 +105,7 @@ impl ChatApp {
             mode: Mode::Chat,
             history: vec![ChatItem::new(
                 "system",
-                "AgentRust — type /settings to configure provider, /help for commands",
+                "AgentRust · 输入 /settings 配置，/help 查看帮助",
             )],
             input: String::new(),
             busy: false,
@@ -149,7 +153,7 @@ impl ChatApp {
     /// Persist the current form to auth.json. Returns an error string on validation failure.
     fn save_form(&mut self) -> Result<(), String> {
         let kind = ProviderKind::parse(&self.form[0].value)
-            .ok_or_else(|| format!("unknown kind: '{}'", self.form[0].value))?;
+            .ok_or_else(|| format!("未知类型: '{}'", self.form[0].value))?;
         let mut patch = serde_json::Map::new();
         patch.insert("provider".into(), serde_json::json!(kind.display()));
         let mut sec = serde_json::Map::new();
@@ -169,11 +173,11 @@ impl ChatApp {
         let merged = serde_json::Value::Object(patch);
         match write_auth_json(&merged) {
             Ok(Some(path)) => {
-                self.status = format!("saved → {}", path.display());
+                self.status = format!("已保存 → {}", path.display());
                 Ok(())
             }
-            Ok(None) => Err("no HOME/USERPROFILE to write auth.json".into()),
-            Err(e) => Err(format!("write failed: {e}")),
+            Ok(None) => Err("没有 HOME/USERPROFILE 目录，无法写入 auth.json".into()),
+            Err(e) => Err(format!("写入失败：{e}")),
         }
     }
 
@@ -187,7 +191,7 @@ impl ChatApp {
         self.stream_tx = Some(tx.clone());
         self.stream_rx = Some(rx);
         self.busy = true;
-        self.status = "streaming…".to_string();
+        self.status = "生成中…".to_string();
         let item_idx = self.history.len();
         self.history.push(ChatItem::new("assistant", ""));
         self.streaming_item = Some(item_idx);
@@ -200,7 +204,7 @@ impl ChatApp {
                 .unwrap_or("openai chat");
             let Some(kind) = ProviderKind::parse(kind_s) else {
                 let _ = tx.send(StreamMsg::Err(
-                    "no valid provider configured; run /settings".into(),
+                    "没有配置有效的 provider；请执行 /settings 设置".into(),
                 ));
                 return;
             };
@@ -232,7 +236,7 @@ impl ChatApp {
             let provider = match pc.provider_for(&model) {
                 Some(p) => p,
                 None => {
-                    let _ = tx.send(StreamMsg::Err(format!("no provider for {}", model.id)));
+                    let _ = tx.send(StreamMsg::Err(format!("没有可用的 provider：{}", model.id)));
                     return;
                 }
             };
@@ -265,7 +269,7 @@ impl ChatApp {
                             }
                             Ok(agent_ai::stream::StreamEvent::Usage { usage }) => {
                                 let _ = tx.send(StreamMsg::Done(format!(
-                                    "usage: in={} out={} cache_read={} cache_write={} total={}",
+                                    "用量：输入={} 输出={} 缓存读={} 缓存写={} 总计={}",
                                     usage.input,
                                     usage.output,
                                     usage.cache_read,
@@ -274,7 +278,7 @@ impl ChatApp {
                                 )));
                             }
                             Ok(agent_ai::stream::StreamEvent::Done { stop_reason }) => {
-                                let _ = tx.send(StreamMsg::Done(format!("stop: {stop_reason:?}")));
+                                let _ = tx.send(StreamMsg::Done(format!("结束：{stop_reason:?}")));
                             }
                             Err(e) => {
                                 let _ = tx.send(StreamMsg::Err(format!("{e}")));
@@ -286,7 +290,7 @@ impl ChatApp {
                 agent_ai::provider::ProviderResponse::Done { text, usage, .. } => {
                     let _ = tx.send(StreamMsg::Delta(text));
                     let _ = tx.send(StreamMsg::Done(format!(
-                        "usage: in={} out={}",
+                        "用量：输入={} 输出={}",
                         usage.input, usage.output
                     )));
                 }
@@ -315,7 +319,7 @@ async fn run_loop(
                     // payload is the usage summary when emitted by the Usage event,
                     // or the stop reason when emitted by the final Done event.
                     StreamMsg::Done(s) => {
-                        if s.starts_with("usage:") {
+                        if s.starts_with("用量：") {
                             app.usage_str = s;
                         } else {
                             app.busy = false;
@@ -332,9 +336,9 @@ async fn run_loop(
                         }
                     }
                     StreamMsg::Err(e) => {
-                        app.status = format!("error: {e}");
+                        app.status = format!("错误：{e}");
                         app.history
-                            .push(ChatItem::new("system", &format!("error: {e}")));
+                            .push(ChatItem::new("system", &format!("错误：{e}")));
                         app.busy = false;
                         app.stream_rx = None;
                         app.stream_tx = None;
@@ -390,11 +394,11 @@ fn draw_chat(f: &mut Frame, app: &ChatApp) {
         .history
         .iter()
         .flat_map(|item| {
-            let role_color = match item.role.as_str() {
-                "user" => Color::Cyan,
-                "assistant" => Color::LightGreen,
-                "system" => Color::DarkGray,
-                _ => Color::White,
+            let (role_color, role_label) = match item.role.as_str() {
+                "user" => (Color::Cyan, "你"),
+                "assistant" => (Color::LightGreen, "助手"),
+                "system" => (Color::DarkGray, "系统"),
+                _ => (Color::White, item.role.as_str()),
             };
             let item_lines: Vec<Line> = item
                 .text
@@ -402,7 +406,7 @@ fn draw_chat(f: &mut Frame, app: &ChatApp) {
                 .map(|l| {
                     Line::from(vec![
                         Span::styled(
-                            format!("{} ", item.role),
+                            format!("{role_label} "),
                             Style::default().fg(role_color).add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(l),
@@ -413,7 +417,7 @@ fn draw_chat(f: &mut Frame, app: &ChatApp) {
         })
         .collect();
     let title = if app.busy {
-        " AgentRust (streaming…) "
+        " AgentRust（生成中…） "
     } else {
         " AgentRust "
     };
@@ -428,7 +432,7 @@ fn draw_chat(f: &mut Frame, app: &ChatApp) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" input (/settings /help /exit) "),
+                .title(" 输入（/settings /help /exit） "),
         );
     let input_area = chunks[1];
     f.render_widget(input, input_area);
@@ -436,10 +440,10 @@ fn draw_chat(f: &mut Frame, app: &ChatApp) {
 
     // status
     let cfg = format!(
-        "{} · model: {}",
+        "{} · 模型: {}",
         app.form[0].value,
         if app.form[3].value.is_empty() {
-            "(not set; run /settings)"
+            "（未设置，请运行 /settings）"
         } else {
             &app.form[3].value
         }
@@ -472,8 +476,14 @@ fn draw_settings(f: &mut Frame, app: &ChatApp) {
         } else {
             Style::default().fg(Color::Cyan)
         };
-        let masked = field.label == "api key" && !field.value.is_empty();
-        let shown = if masked {
+        // kind is a selector; others are free text
+        let shown: String = if i == 0 {
+            let idx = KIND_OPTIONS
+                .iter()
+                .position(|o| *o == field.value)
+                .unwrap_or(0);
+            format!("⟨ {} ⟩  （← → 切换）", KIND_OPTIONS[idx])
+        } else if field.label == "API 密钥" && !field.value.is_empty() {
             "••••••".to_string()
         } else {
             field.value.clone()
@@ -493,25 +503,35 @@ fn draw_settings(f: &mut Frame, app: &ChatApp) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" /settings — provider "),
+                .title(" /settings · 配置 "),
         )
         .wrap(Wrap { trim: false });
     f.render_widget(form, chunks[0]);
 
     let help = Paragraph::new(
-        " ↑/↓ or Tab select field · type to edit · Enter save & return · Esc cancel ",
+        " ↑/↓ 或 Tab 选择字段 · ← → 切换类型 · 输入编辑 · Enter 保存并返回 · Esc 取消 ",
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(help, chunks[1]);
 
     // edit bar
     let status_bar = if app.form_active == 2 {
-        Paragraph::new(" api key stored locally in auth.json (plaintext); chmod recommended on shared machines ")
+        Paragraph::new(" API 密钥保存在本地 auth.json（明文）；共享机器建议限制文件权限 ")
             .style(Style::default().fg(Color::Yellow))
     } else {
         Paragraph::new(app.status.as_str())
     };
     f.render_widget(status_bar, chunks[2]);
+}
+
+/// Next kind option in the selector, wrapping. `right=true` advances, false steps back.
+fn cycle_kind(current: &str, right: bool) -> &'static str {
+    let cur = KIND_OPTIONS.iter().position(|o| *o == current).unwrap_or(0);
+    KIND_OPTIONS[if right {
+        (cur + 1) % KIND_OPTIONS.len()
+    } else {
+        (cur + KIND_OPTIONS.len() - 1) % KIND_OPTIONS.len()
+    }]
 }
 
 /// Returns false to quit the loop.
@@ -526,7 +546,7 @@ fn handle_settings_key(app: &mut ChatApp, code: KeyCode) -> bool {
     match code {
         KeyCode::Esc => {
             app.mode = Mode::Chat;
-            app.status = "settings discarded".to_string();
+            app.status = "已放弃修改".to_string();
             true
         }
         KeyCode::Up => {
@@ -541,22 +561,33 @@ fn handle_settings_key(app: &mut ChatApp, code: KeyCode) -> bool {
             app.form_active = (app.form_active + 1) % app.form.len();
             true
         }
+        KeyCode::Left | KeyCode::Right => {
+            if app.form_active == 0 {
+                app.form[0].value =
+                    cycle_kind(&app.form[0].value, code == KeyCode::Right).to_string();
+            }
+            true
+        }
         KeyCode::Enter => {
             match app.save_form() {
                 Ok(()) => {
                     app.mode = Mode::Chat;
-                    app.status = "settings saved".to_string();
+                    app.status = "设置已保存".to_string();
                 }
                 Err(e) => app.status = e,
             }
             true
         }
         KeyCode::Backspace => {
-            app.form[app.form_active].value.pop();
+            if app.form_active != 0 {
+                app.form[app.form_active].value.pop();
+            }
             true
         }
         KeyCode::Char(c) => {
-            app.form[app.form_active].value.push(c);
+            if app.form_active != 0 {
+                app.form[app.form_active].value.push(c);
+            }
             true
         }
         _ => true,
@@ -586,7 +617,7 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                 "/help" => {
                     app.history.push(ChatItem::new(
                         "system",
-                        "/settings — configure provider · /exit — quit · anything else — send to model",
+                        "/settings 配置 · /exit 退出 · 其他输入发送给模型",
                     ));
                     app.input.clear();
                 }
@@ -607,5 +638,30 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
             true
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycle_kind_wraps_forward() {
+        assert_eq!(cycle_kind("anthropic messages", true), "openai chat");
+        assert_eq!(cycle_kind("openai chat", true), "openai responses");
+        assert_eq!(cycle_kind("openai responses", true), "deepseek chat");
+        assert_eq!(cycle_kind("deepseek chat", true), "anthropic messages");
+    }
+
+    #[test]
+    fn cycle_kind_wraps_backward() {
+        assert_eq!(cycle_kind("anthropic messages", false), "deepseek chat");
+        assert_eq!(cycle_kind("deepseek chat", false), "openai responses");
+    }
+
+    #[test]
+    fn cycle_kind_unknown_falls_to_first() {
+        assert_eq!(cycle_kind("bogus", true), "openai chat");
+        assert_eq!(cycle_kind("bogus", false), "deepseek chat");
     }
 }
