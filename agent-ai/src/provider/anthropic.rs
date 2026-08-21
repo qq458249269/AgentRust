@@ -185,13 +185,17 @@ fn conv_message(m: &crate::provider::ChatMessage) -> Value {
 
 /// Drain a reqwest bytes stream, split into SSE `data:` lines, map to StreamEvents.
 async fn run_sse(stream: reqwest::Response, tx: StreamSender) {
+    tracing::info!("SSE 解析任务启动");
     let mut raw_rx = spawn_sse_producer(stream);
 
     let mut parser = AnthropicParser::default();
+    let mut line_count = 0u32;
     while let Some(payload) = raw_rx.recv().await {
         match payload {
             Ok(line) => {
-                tracing::trace!("sse raw line");
+                line_count += 1;
+                let preview = if line.len() > 120 { &line[..120] } else { &line };
+                tracing::info!("SSE raw line #{line_count}: {preview}");
                 if let Err(e) = parser.feed(&line, &tx).await {
                     let _ = tx.send(Err(e)).await;
                     return;
@@ -203,6 +207,7 @@ async fn run_sse(stream: reqwest::Response, tx: StreamSender) {
             }
         }
     }
+    tracing::info!("SSE raw lines 总计: {line_count}");
 }
 
 /// Aggregates Anthropic event JSON into StreamEvents.
@@ -222,8 +227,12 @@ impl AnthropicParser {
         }
         let ev: EventEnvelope = match serde_json::from_str(line) {
             Ok(e) => e,
-            Err(_) => return Ok(()), // keep-alive / non-JSON
+            Err(e) => {
+                tracing::debug!("SSE 解析失败: {e}, line={}", &line[..line.len().min(200)]);
+                return Ok(());
+            }
         };
+        tracing::debug!("SSE 事件: type={}", ev.event_type);
         match ev.event_type.as_str() {
             "message_start" => {
                 if let Some(usage) = ev.rest.get("message").and_then(|m| m.get("usage")) {
@@ -262,6 +271,7 @@ impl AnthropicParser {
                 }
             }
             "content_block_delta" => {
+                tracing::debug!("content_block_delta: delta={:?}", ev.rest.get("delta"));
                 if let Some(delta) = ev.rest.get("delta") {
                     match delta.get("type").and_then(Value::as_str) {
                         Some("text_delta") => {

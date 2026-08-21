@@ -93,11 +93,16 @@ impl ChatProvider for OpenAiChatProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         tokio::spawn(async move {
+            tracing::info!("OpenAI SSE 任务启动");
             let mut raw_rx = spawn_sse_producer(resp);
             let mut parser = ChatCompletionsParser::default();
+            let mut line_count = 0u32;
             while let Some(payload) = raw_rx.recv().await {
                 match payload {
                     Ok(line) => {
+                        line_count += 1;
+                        let preview = if line.len() > 200 { &line[..200] } else { &line };
+                        tracing::info!("OpenAI SSE raw #{line_count}: {preview}");
                         if let Err(e) = parser.feed(&line, &tx).await {
                             let _ = tx.send(Err(e)).await;
                             return;
@@ -109,6 +114,7 @@ impl ChatProvider for OpenAiChatProvider {
                     }
                 }
             }
+            tracing::info!("OpenAI SSE raw lines 总计: {line_count}");
         });
 
         Ok(ProviderResponse::Stream(StreamReader::new(rx)))
@@ -312,8 +318,12 @@ impl ChatCompletionsParser {
         }
         let chunk: Chunk = match serde_json::from_str(line) {
             Ok(c) => c,
-            Err(_) => return Ok(()), // keep-alive / non-JSON
+            Err(e) => {
+                tracing::debug!("OpenAI chunk 解析失败: {e}");
+                return Ok(());
+            }
         };
+        tracing::debug!("OpenAI chunk: choices={}, finish_reason={:?}", chunk.choices.len(), chunk.choices.first().and_then(|c| c.finish_reason.as_deref()));
 
         if let Some(u) = chunk.usage {
             self.input = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
@@ -325,8 +335,11 @@ impl ChatCompletionsParser {
         }
 
         for choice in &chunk.choices {
+            let has_content = choice.delta.content.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+            tracing::debug!("OpenAI choice: has_content={has_content}, finish_reason={:?}", choice.finish_reason);
             if let Some(text) = &choice.delta.content {
                 if !text.is_empty() {
+                    tracing::info!("OpenAI 发送 TextDelta: {} 字节", text.len());
                     tx.send(Ok(StreamEvent::TextDelta {
                         delta: text.clone(),
                     }))
@@ -391,11 +404,13 @@ impl ChatCompletionsParser {
                         total: self.total,
                         cost: 0.0,
                     };
+                    tracing::info!("OpenAI 发送 Usage: in={} out={}", usage.input, usage.output);
                     tx.send(Ok(StreamEvent::Usage { usage }))
                         .await
                         .map_err(|_| AiError::Other("流已关闭".into()))?;
                 }
                 let sr = self.stop;
+                tracing::info!("OpenAI 发送 Done: {sr:?}");
                 tx.send(Ok(StreamEvent::Done { stop_reason: sr }))
                     .await
                     .map_err(|_| AiError::Other("流已关闭".into()))?;

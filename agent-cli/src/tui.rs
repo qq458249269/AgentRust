@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
-use std::sync::mpsc;
+use tokio::sync::mpsc as tokio_mpsc;
 use std::time::{Duration, Instant};
 
 pub async fn run(_session: AgentSession, _cli: &CommonArgs) -> anyhow::Result<()> {
@@ -107,8 +107,8 @@ struct ChatApp {
     input_history: Vec<String>,
     input_history_idx: Option<usize>,
     busy: bool,
-    stream_tx: Option<mpsc::Sender<StreamMsg>>,
-    stream_rx: Option<mpsc::Receiver<StreamMsg>>,
+    stream_tx: Option<tokio_mpsc::Sender<StreamMsg>>,
+    stream_rx: Option<tokio_mpsc::Receiver<StreamMsg>>,
     status: String,
     form: Vec<FormField>,
     form_active: usize,
@@ -293,7 +293,7 @@ impl ChatApp {
         self.push_input_history();
         self.history.push(ChatItem::new("user", &text));
         self.input.clear();
-        let (tx, rx) = mpsc::channel::<StreamMsg>();
+        let (tx, rx) = tokio_mpsc::channel::<StreamMsg>(256);
         self.stream_tx = Some(tx.clone());
         self.stream_rx = Some(rx);
         self.busy = true;
@@ -436,12 +436,13 @@ async fn run_loop(
 
     loop {
         // drain stream messages
-        if let Some(rx) = &app.stream_rx {
+        if let Some(rx) = &mut app.stream_rx {
             let mut finished = false;
             while let Ok(msg) = rx.try_recv() {
                 tracing::trace!("收到消息: {:?}", std::mem::discriminant(&msg));
                 match msg {
                     StreamMsg::Delta(d) => {
+                        tracing::debug!("TUI 收到 Delta: {} 字节", d.len());
                         if let Some(idx) = app.streaming_item {
                             app.history[idx].text.push_str(&d);
                         }
