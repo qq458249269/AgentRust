@@ -76,14 +76,14 @@ const FORM_LABELS: [(&str, &str); 4] = [
     ),
 ];
 
-/// Slash commands: (trigger, description).
+/// 斜杠命令: (触发, 说明).
 const COMMANDS: [(&str, &str); 6] = [
-    ("/settings", "配置接口（类型/地址/密钥/模型）"),
-    ("/help", "查看帮助"),
-    ("/clear", "清空会话记录"),
-    ("/stats", "显示统计信息"),
-    ("/model", "显示当前模型"),
-    ("/exit", "退出"),
+    ("/设置", "配置接口（类型/地址/密钥/模型）"),
+    ("/帮助", "查看帮助"),
+    ("/清空", "清空会话记录"),
+    ("/统计", "显示统计信息"),
+    ("/模型", "显示当前模型"),
+    ("/退出", "退出"),
 ];
 
 enum Mode {
@@ -902,24 +902,24 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
             if text.is_empty() {
                 return true;
             }
-            if text == "/exit" || text == "/quit" {
+            if text == "/退出" || text == "/quit" {
                 return false;
             }
             match text.as_str() {
-                "/settings" => {
+                "/设置" => {
                     app.load_form();
                     app.mode = Mode::Settings;
                     app.input.clear();
                     app.status = String::new();
                 }
-                "/help" => {
+                "/帮助" => {
                     app.history.push(ChatItem::new(
                         "system",
-                        "快捷键：\n  ↑/↓    翻阅输入历史\n  Tab    命令补全\n  PgUp/Dn 滚动聊天记录\n  Esc    取消生成\n  Ctrl+C  退出\n  Ctrl+L  清屏\n\n命令：\n  /settings  配置\n  /clear     清空记录\n  /stats     统计信息\n  /model     当前模型\n  /help      帮助\n  /exit      退出",
+                        "快捷键：\n  ↑/↓    翻阅输入历史\n  Tab    命令补全\n  PgUp/Dn 滚动聊天记录\n  Esc    取消生成\n  Ctrl+C  退出\n  Ctrl+L  清屏\n\n命令：\n  /设置    配置\n  /清空    清空记录\n  /统计    统计信息\n  /模型    当前模型\n  /帮助    帮助\n  /退出    退出",
                     ));
                     app.input.clear();
                 }
-                "/clear" => {
+                "/清空" => {
                     app.history.clear();
                     app.history.push(ChatItem::new(
                         "system",
@@ -929,7 +929,7 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                     app.total_output_tokens = 0;
                     app.input.clear();
                 }
-                "/stats" => {
+                "/统计" => {
                     let msg_count = app.history.len();
                     let user_msgs = app
                         .history
@@ -951,7 +951,7 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                     ));
                     app.input.clear();
                 }
-                "/model" => {
+                "/模型" => {
                     let model = if app.form[3].value.is_empty() {
                         "（未设置）".to_string()
                     } else {
@@ -959,7 +959,7 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                     };
                     app.history.push(ChatItem::new(
                         "system",
-                        &format!("Provider: {}\n模型: {}", app.form[0].value, model),
+                        &format!("服务商: {}\n模型: {}", app.form[0].value, model),
                     ));
                     app.input.clear();
                 }
@@ -998,25 +998,25 @@ fn run_command(app: &mut ChatApp, cmd: &str) -> bool {
     app.cmd_menu = None;
     app.input.clear();
     match cmd {
-        "/settings" => {
+        "/设置" => {
             app.load_form();
             app.mode = Mode::Settings;
             app.status = String::new();
         }
-        "/help" => {
+        "/帮助" => {
             app.history.push(ChatItem::new(
                 "system",
-                "快捷键：\n  ↑/↓    翻阅输入历史\n  Tab    命令补全\n  PgUp/Dn 滚动聊天记录\n  Esc    取消生成\n  Ctrl+C  退出\n  Ctrl+L  清屏\n\n命令：\n  /settings  配置\n  /clear     清空记录\n  /stats     统计信息\n  /model     当前模型\n  /help      帮助\n  /exit      退出",
+                "快捷键：\n  ↑/↓    翻阅输入历史\n  Tab    命令补全\n  PgUp/Dn 滚动聊天记录\n  Esc    取消生成\n  Ctrl+C  退出\n  Ctrl+L  清屏\n\n命令：\n  /设置    配置\n  /清空    清空记录\n  /统计    统计信息\n  /模型    当前模型\n  /帮助    帮助\n  /退出    退出",
             ));
         }
-        "/clear" => {
+        "/清空" => {
             app.history.clear();
             app.history
                 .push(ChatItem::new("system", "AgentRust · 记录已清空"));
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
         }
-        "/stats" => {
+        "/统计" => {
             let msg_count = app.history.len();
             let user_msgs = app.history.iter().filter(|m| m.role == "user").count();
             let asst_msgs = app
@@ -1033,7 +1033,7 @@ fn run_command(app: &mut ChatApp, cmd: &str) -> bool {
                 ),
             ));
         }
-        "/model" => {
+        "/模型" => {
             let model = if app.form[3].value.is_empty() {
                 "（未设置）".to_string()
             } else {
@@ -1041,10 +1041,10 @@ fn run_command(app: &mut ChatApp, cmd: &str) -> bool {
             };
             app.history.push(ChatItem::new(
                 "system",
-                &format!("Provider: {}\n模型: {}", app.form[0].value, model),
+                &format!("服务商: {}\n模型: {}", app.form[0].value, model),
             ));
         }
-        "/exit" => return false,
+        "/退出" => return false,
         _ => {}
     }
     true
@@ -1079,12 +1079,12 @@ mod tests {
     #[test]
     fn run_command_dispatches() {
         let mut app = ChatApp::new();
-        assert!(run_command(&mut app, "/settings"));
+        assert!(run_command(&mut app, "/设置"));
         assert!(matches!(app.mode, Mode::Settings));
         app.mode = Mode::Chat;
-        assert!(run_command(&mut app, "/clear"));
+        assert!(run_command(&mut app, "/清空"));
         assert_eq!(app.history.len(), 1);
-        assert!(!run_command(&mut app, "/exit"));
+        assert!(!run_command(&mut app, "/退出"));
     }
 
     #[test]
@@ -1111,9 +1111,9 @@ mod tests {
     #[test]
     fn tab_complete_single_match() {
         let mut app = ChatApp::new();
-        app.input = "/set".to_string();
+        app.input = "/设".to_string();
         app.tab_complete();
-        assert_eq!(app.input, "/settings ");
+        assert_eq!(app.input, "/设置 ");
     }
 
     #[test]
