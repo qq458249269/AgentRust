@@ -2,32 +2,28 @@
 
 use crate::{CommonArgs, PrintArgs};
 use agent_ai::model::{Model, ThinkingLevel};
-use agent_ai::provider::{AnthropicProvider, ChatMessage, Part, ProviderClient, ProviderRequest};
+use agent_ai::provider::{ChatMessage, Part, ProviderClient, ProviderKind, ProviderRequest};
 use agent_ai::stream::StreamEvent;
 use agent_session::AgentSession;
 
 pub async fn run(_session: AgentSession, cli: &CommonArgs, args: &PrintArgs) -> anyhow::Result<()> {
-    let key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set; needed for print mode"))?;
-
+    // kind first, then url + key (each: override -> auth.json -> env/default)
+    let kind = ProviderKind::parse(&cli.provider)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider kind: {}", cli.provider))?;
     let model_id = cli
         .model
         .clone()
         .unwrap_or_else(|| "claude-sonnet-4-5".to_string());
     let model = Model {
-        provider: cli.provider.clone(),
+        provider: kind.id().to_string(),
         id: model_id,
         context_window: 200_000,
         max_tokens: 4096,
     };
 
+    let api_key = kind.resolve_key(cli.api_key.as_deref());
     let mut client = ProviderClient::new();
-    let provider = AnthropicProvider::new(
-        cli.base_url
-            .clone()
-            .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string()),
-    );
-    client.register(Box::new(provider));
+    client.setup(kind, api_key, cli.base_url.clone());
 
     let p = client
         .provider_for(&model)
@@ -48,7 +44,7 @@ pub async fn run(_session: AgentSession, cli: &CommonArgs, args: &PrintArgs) -> 
 
     use anyhow::Context;
     let resp = p
-        .chat(&crate::client(), &req, &key)
+        .chat(&crate::client(), &req)
         .await
         .context("provider chat")?;
 

@@ -32,6 +32,10 @@ struct Cli {
     /// override provider base URL (e.g. local mock server); default per provider
     #[arg(long, global = true)]
     base_url: Option<String>,
+
+    /// API key override (kind = provider type); otherwise auth.json then env var
+    #[arg(long, global = true)]
+    api_key: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -66,12 +70,14 @@ async fn main() -> anyhow::Result<()> {
     let provider = cli.provider.clone();
     let model = cli.model.clone();
     let base_url = cli.base_url.clone();
+    let api_key = cli.api_key.clone();
 
     let common = crate::CommonArgs {
         cwd,
         provider,
         model,
         base_url,
+        api_key,
     };
 
     match cli.mode {
@@ -96,4 +102,5 @@ pub struct CommonArgs {
     pub provider: String,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    pub api_key: Option<String>,
 }

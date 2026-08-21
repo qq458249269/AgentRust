@@ -15,20 +15,28 @@ use serde_json::{json, Value};
 pub struct AnthropicProvider {
     pub base_url: String,
     pub version: String,
+    api_key: String,
 }
 
 impl AnthropicProvider {
-    pub fn new(base_url: impl Into<String>) -> Self {
+    /// Kind-first construction: pick `Anthropic` then supply url + key.
+    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
             version: "2023-06-01".to_string(),
+            api_key: api_key.into(),
         }
+    }
+
+    /// Credentials bound at setup time; never logged or serialized (field is private).
+    pub fn api_key(&self) -> &str {
+        &self.api_key
     }
 }
 
 impl Default for AnthropicProvider {
     fn default() -> Self {
-        Self::new("https://api.anthropic.com/v1/messages")
+        Self::new("https://api.anthropic.com/v1/messages", "")
     }
 }
 
@@ -70,8 +78,12 @@ impl ChatProvider for AnthropicProvider {
         &self,
         client: &crate::Client,
         req: &ProviderRequest,
-        api_key: &str,
     ) -> Result<ProviderResponse, AiError> {
+        if self.api_key.is_empty() {
+            return Err(AiError::Other(
+                "no API key configured; set --api-key, auth.json, or the provider env var".into(),
+            ));
+        }
         let messages: Vec<Value> = req.messages.iter().map(conv_message).collect();
         let tools: Vec<Value> = req
             .tools
@@ -103,7 +115,7 @@ impl ChatProvider for AnthropicProvider {
         let resp = client
             .inner()
             .post(&self.base_url)
-            .header("x-api-key", api_key)
+            .header("x-api-key", &self.api_key)
             .header("anthropic-version", &self.version)
             .header("content-type", "application/json")
             .body(serde_json::to_vec(&body)?)
