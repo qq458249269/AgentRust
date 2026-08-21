@@ -39,20 +39,12 @@ jobs:
       - name: 运行测试
         run: cargo test --all
 
-      - name: 生成版本号（0.YYYYMMDD.N）
+      - name: 生成版本号
         id: version
         shell: bash
         run: |
-          DATE=$(date +%%Y%%m%%d)
-          COUNT_FILE=".github/build-count-${DATE}"
-          if [ -f "$COUNT_FILE" ]; then
-            LAST=$(cat "$COUNT_FILE")
-          else
-            LAST=0
-          fi
-          NEXT=$((LAST + 1))
-          echo "$NEXT" > "$COUNT_FILE"
-          VERSION="0.${DATE}.${NEXT}"
+          DATE=$(date +%Y%m%d)
+          VERSION="0.${DATE}.${{ github.run_number }}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "版本号: ${VERSION}"
 
@@ -90,6 +82,9 @@ jobs:
         with:
           path: artifacts
           pattern: agent-windows-x86_64-*
+
+      - name: 查看产物
+        run: find artifacts/ -type f
 
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
