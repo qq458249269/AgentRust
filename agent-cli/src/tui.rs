@@ -57,7 +57,7 @@ const FORM_LABELS: [(&str, &str); 4] = [
     ("类型", "← → 切换类型"),
     (
         "接口地址",
-        "留空用默认地址，例如 https://api.anthropic.com/v1/messages",
+        "填到前缀即可，例如 https://api.openai.com/v1；留空用默认",
     ),
     ("API 密钥", "留空则尝试环境变量"),
     (

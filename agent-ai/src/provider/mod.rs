@@ -366,14 +366,42 @@ impl ProviderKind {
         self.vendor
     }
 
+    /// base URL prefix for this kind (scheme + host + /v1 when the vendor uses it);
+    /// the per-API path is appended by [`Self::join_api_path`].
     pub fn default_base_url(&self) -> &'static str {
         match (self.vendor, self.api) {
-            ("openai", ApiVariant::Chat) => "https://api.openai.com/v1/chat/completions",
-            ("openai", ApiVariant::Responses) => "https://api.openai.com/v1/responses",
-            ("deepseek", ApiVariant::Chat) => "https://api.deepseek.com/chat/completions",
-            ("anthropic", ApiVariant::Messages) => "https://api.anthropic.com/v1/messages",
+            ("openai", ApiVariant::Chat) | ("openai", ApiVariant::Responses) => {
+                "https://api.openai.com/v1"
+            }
+            ("deepseek", ApiVariant::Chat) => "https://api.deepseek.com/v1",
+            ("anthropic", ApiVariant::Messages) => "https://api.anthropic.com/v1",
             (v, _) => unreachable!("unknown vendor {v}"),
         }
+    }
+
+    /// API path suffix for this kind, e.g. `/chat/completions`.
+    pub fn api_path(&self) -> &'static str {
+        match (self.vendor, self.api) {
+            ("openai", ApiVariant::Chat) | ("deepseek", ApiVariant::Chat) => "/chat/completions",
+            ("openai", ApiVariant::Responses) => "/responses",
+            ("anthropic", ApiVariant::Messages) => "/messages",
+            (v, _) => unreachable!("unknown vendor {v}"),
+        }
+    }
+
+    /// Join a base URL (`https://api.example.com/v1`) with the API path.
+    /// Configuration may already include the full path (`…/v1/chat/completions`);
+    /// we then leave it untouched.
+    pub fn join_api_path(&self, base: &str) -> String {
+        let path = self.api_path();
+        if base.ends_with(path) {
+            return base.to_string();
+        }
+        let trimmed = base.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return format!("{}", self.default_base_url());
+        }
+        format!("{trimmed}{path}")
     }
 
     /// human form, e.g. `openai chat`
@@ -424,6 +452,7 @@ impl ProviderKind {
         base_url: Option<String>,
     ) -> Box<dyn ChatProvider> {
         let url = self.resolve_base_url(base_url.as_deref());
+        let url = self.join_api_path(&url);
         let key = api_key.unwrap_or_default();
         match (self.vendor, self.api) {
             ("anthropic", ApiVariant::Messages) => Box::new(AnthropicProvider::new(url, key)),
@@ -495,5 +524,35 @@ mod auth_tests {
         assert_eq!(root["default_model"], "gpt-4o-mini");
         let _ = std::fs::remove_file(&p);
         std::env::remove_var("AGENTRUST_AUTH");
+    }
+
+    #[test]
+    fn join_api_path_handles_prefix_and_full() {
+        let chat = ProviderKind::parse("openai chat").unwrap();
+        // prefix only -> append path
+        assert_eq!(
+            chat.join_api_path("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // full path already present -> unchanged
+        assert_eq!(
+            chat.join_api_path("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // trailing slash tolerated
+        assert_eq!(
+            chat.join_api_path("http://127.0.0.1:18081/v1/"),
+            "http://127.0.0.1:18081/v1/chat/completions"
+        );
+        let messages = ProviderKind::parse("anthropic").unwrap();
+        assert_eq!(
+            messages.join_api_path("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        let responses = ProviderKind::parse("openai responses").unwrap();
+        assert_eq!(
+            responses.join_api_path("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses"
+        );
     }
 }
