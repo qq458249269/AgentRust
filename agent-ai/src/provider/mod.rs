@@ -3,6 +3,9 @@
 pub mod anthropic;
 pub use anthropic::AnthropicProvider;
 
+pub mod openai;
+pub use openai::{OpenAiChatProvider, OpenAiResponsesProvider, PendingProvider};
+
 use crate::error::AiError;
 use crate::model::Model;
 use crate::stream::{StreamEvent, StreamReader};
@@ -161,27 +164,59 @@ mod tests {
     fn kind_parse_and_id() {
         assert_eq!(
             ProviderKind::parse("anthropic"),
-            Some(ProviderKind::Anthropic)
+            Some(ProviderKind {
+                vendor: "anthropic",
+                api: ApiVariant::Messages,
+            })
         );
-        assert_eq!(ProviderKind::parse("Claude"), Some(ProviderKind::Anthropic));
-        assert_eq!(ProviderKind::parse("openai"), None);
-        assert_eq!(ProviderKind::Anthropic.id(), "anthropic");
+        assert_eq!(
+            ProviderKind::parse("Claude"),
+            Some(ProviderKind {
+                vendor: "anthropic",
+                api: ApiVariant::Messages,
+            })
+        );
+        assert_eq!(
+            ProviderKind::parse("openai chat"),
+            Some(ProviderKind {
+                vendor: "openai",
+                api: ApiVariant::Chat,
+            })
+        );
+        assert_eq!(
+            ProviderKind::parse("openai chat-resp"),
+            Some(ProviderKind {
+                vendor: "openai",
+                api: ApiVariant::Responses,
+            })
+        );
+        assert_eq!(
+            ProviderKind::parse("openai responses").unwrap().api,
+            ApiVariant::Responses
+        );
+        assert_eq!(
+            ProviderKind::parse("deepseek chat").unwrap().vendor,
+            "deepseek"
+        );
+        assert_eq!(ProviderKind::parse("bogus"), None);
+        assert_eq!(ProviderKind::parse("openai chat extra"), None);
+        assert_eq!(
+            ProviderKind::parse("anthropic").unwrap().display(),
+            "anthropic messages"
+        );
+        assert_eq!(
+            ProviderKind::parse("openai").unwrap().display(),
+            "openai chat"
+        );
     }
 
     /// key resolution chain: override wins over env var
     #[test]
     fn resolve_key_prefers_override() {
         std::env::set_var("ANTHROPIC_API_KEY", "env-key");
-        assert_eq!(
-            ProviderKind::Anthropic
-                .resolve_key(Some("cli-key"))
-                .as_deref(),
-            Some("cli-key")
-        );
-        assert_eq!(
-            ProviderKind::Anthropic.resolve_key(Some("")).as_deref(),
-            Some("env-key")
-        );
+        let k = ProviderKind::parse("anthropic").unwrap();
+        assert_eq!(k.resolve_key(Some("cli-key")).as_deref(), Some("cli-key"));
+        assert_eq!(k.resolve_key(Some("")).as_deref(), Some("env-key"));
     }
 
     /// setup() by kind swaps the provider in place, retaining kind as identity
@@ -196,7 +231,8 @@ mod tests {
                 max_tokens: 1,
             })
             .is_none());
-        c.setup(ProviderKind::Anthropic, Some("k1".into()), None);
+        let kind = ProviderKind::parse("anthropic").unwrap();
+        c.setup(kind, Some("k1".into()), None);
         assert!(c
             .provider_for(&Model {
                 provider: "anthropic".into(),
@@ -206,43 +242,109 @@ mod tests {
             })
             .is_some());
         // re-setup keeps exactly one anthropic provider
-        c.setup(ProviderKind::Anthropic, Some("k2".into()), None);
+        c.setup(kind, Some("k2".into()), None);
         assert_eq!(c.providers.len(), 1);
         assert_eq!(c.providers[0].id(), "anthropic");
     }
 }
 
-/// Provider selection: pick the kind first, then fill in url + key.
-/// CLAUDE.md-friendly glossary: kind=type, key=api key, base_url=url.
+/// API surface shape of a provider. `openai chat` vs `openai responses` differ enough
+/// (endpoint, stream schema, auth header) that the variant is part of the identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderKind {
-    Anthropic,
+pub enum ApiVariant {
+    /// OpenAI-compatible chat completions (`/chat/completions`, SSE `choices[].delta`)
+    Chat,
+    /// OpenAI Responses API (`/responses`, SSE `response.output_text.delta`)
+    Responses,
+    /// Anthropic Messages API (`/v1/messages`, SSE `content_block_delta`)
+    Messages,
+}
+
+/// Provider selection: pick `vendor + api variant` first, then fill in url + key.
+/// CLAUDE.md-friendly glossary: kind=type, key=api key, base_url=url.
+/// Strings look like `anthropic messages`, `openai chat`, `openai responses`,
+/// `deepseek chat`. The variant defaults per vendor when omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderKind {
+    pub vendor: &'static str,
+    pub api: ApiVariant,
 }
 
 impl ProviderKind {
     pub fn parse(s: &str) -> Option<ProviderKind> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "anthropic" | "claude" => Some(ProviderKind::Anthropic),
+        let mut it = s.split_whitespace();
+        let vendor = it.next()?.to_ascii_lowercase();
+        let api = it.next().map(|a| a.to_ascii_lowercase());
+        if it.next().is_some() {
+            return None; // too many words
+        }
+        match vendor.as_str() {
+            "anthropic" | "claude" => match api.as_deref() {
+                None | Some("messages") => Some(ProviderKind {
+                    vendor: "anthropic",
+                    api: ApiVariant::Messages,
+                }),
+                _ => None,
+            },
+            "openai" => match api.as_deref() {
+                None | Some("chat") | Some("chat-completions") | Some("chatcompletions") => {
+                    Some(ProviderKind {
+                        vendor: "openai",
+                        api: ApiVariant::Chat,
+                    })
+                }
+                Some("responses") | Some("resp") | Some("chat-resp") | Some("chatresp") => {
+                    Some(ProviderKind {
+                        vendor: "openai",
+                        api: ApiVariant::Responses,
+                    })
+                }
+                _ => None,
+            },
+            "deepseek" => match api.as_deref() {
+                None | Some("chat") | Some("chat-completions") | Some("chatcompletions") => {
+                    Some(ProviderKind {
+                        vendor: "deepseek",
+                        api: ApiVariant::Chat,
+                    })
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
 
+    /// stable vendor id (matches `Model.provider` and auth.json section)
     pub fn id(&self) -> &'static str {
-        match self {
-            ProviderKind::Anthropic => "anthropic",
-        }
+        self.vendor
     }
 
     pub fn default_base_url(&self) -> &'static str {
-        match self {
-            ProviderKind::Anthropic => "https://api.anthropic.com/v1/messages",
+        match (self.vendor, self.api) {
+            ("openai", ApiVariant::Chat) => "https://api.openai.com/v1/chat/completions",
+            ("openai", ApiVariant::Responses) => "https://api.openai.com/v1/responses",
+            ("deepseek", ApiVariant::Chat) => "https://api.deepseek.com/chat/completions",
+            ("anthropic", ApiVariant::Messages) => "https://api.anthropic.com/v1/messages",
+            (v, _) => unreachable!("unknown vendor {v}"),
+        }
+    }
+
+    /// human form, e.g. `openai chat`
+    pub fn display(&self) -> String {
+        match self.api {
+            ApiVariant::Messages => format!("{} messages", self.vendor),
+            ApiVariant::Responses => format!("{} responses", self.vendor),
+            ApiVariant::Chat => format!("{} chat", self.vendor),
         }
     }
 
     /// env var holding the key for this kind
     pub fn env_key_var(&self) -> &'static str {
-        match self {
-            ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
+        match self.vendor {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "openai" => "OPENAI_API_KEY",
+            "deepseek" => "DEEPSEEK_API_KEY",
+            v => unreachable!("unknown vendor {v}"),
         }
     }
 
@@ -274,11 +376,17 @@ impl ProviderKind {
         api_key: Option<String>,
         base_url: Option<String>,
     ) -> Box<dyn ChatProvider> {
-        match self {
-            ProviderKind::Anthropic => Box::new(AnthropicProvider::new(
-                self.resolve_base_url(base_url.as_deref()),
-                api_key.unwrap_or_default(),
-            )),
+        let url = self.resolve_base_url(base_url.as_deref());
+        let key = api_key.unwrap_or_default();
+        match (self.vendor, self.api) {
+            ("anthropic", ApiVariant::Messages) => Box::new(AnthropicProvider::new(url, key)),
+            ("openai", ApiVariant::Chat) | ("deepseek", ApiVariant::Chat) => {
+                Box::new(OpenAiChatProvider::new(url, key))
+            }
+            (v, a) => {
+                // vendor+api registered but not yet implemented; return a stub that errors
+                Box::new(PendingProvider { vendor: v, api: a })
+            }
         }
     }
 

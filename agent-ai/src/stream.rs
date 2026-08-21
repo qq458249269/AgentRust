@@ -180,6 +180,37 @@ impl SseSplitter {
     }
 }
 
+/// Spawn a background task reading an HTTP response body, splitting SSE `data:` lines,
+/// and emitting raw payload strings into an unbounded channel; returns the receiver.
+/// The caller drives the receiver and maps each line into StreamEvents.
+pub fn spawn_sse_producer(
+    resp: reqwest::Response,
+) -> mpsc::UnboundedReceiver<Result<String, AiError>> {
+    let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+    let mut splitter = SseSplitter::new(raw_tx);
+
+    tokio::spawn(async move {
+        let mut stream = resp;
+        loop {
+            match stream.chunk().await {
+                Ok(Some(bytes)) => {
+                    if splitter.push(bytes).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = splitter.out_send_err(AiError::from(e));
+                    return;
+                }
+            }
+        }
+        let _ = splitter.finish();
+    });
+
+    raw_rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

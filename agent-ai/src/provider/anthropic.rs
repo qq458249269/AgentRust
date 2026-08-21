@@ -7,7 +7,7 @@
 use crate::error::AiError;
 use crate::model::{Model, Usage};
 use crate::provider::{ChatProvider, ProviderRequest, ProviderResponse, StreamSender};
-use crate::stream::{SseSplitter, StopReason, StreamEvent, StreamReader};
+use crate::stream::{spawn_sse_producer, StopReason, StreamEvent, StreamReader};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -184,37 +184,8 @@ fn conv_message(m: &crate::provider::ChatMessage) -> Value {
 }
 
 /// Drain a reqwest bytes stream, split into SSE `data:` lines, map to StreamEvents.
-async fn run_sse(mut stream: reqwest::Response, tx: StreamSender) {
-    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut splitter = SseSplitter::new(raw_tx);
-
-    // Producer task owns the HTTP stream + splitter; emits raw data lines.
-    // raw_tx is dropped when it finishes, ending the `raw_rx` loop below.
-    tokio::spawn(async move {
-        let mut n = 0u64;
-        loop {
-            match stream.chunk().await {
-                Ok(Some(bytes)) => {
-                    n += 1;
-                    tracing::trace!("sse chunk #{n} bytes={}", bytes.len());
-                    if splitter.push(bytes).is_err() {
-                        tracing::warn!("sse splitter push failed (consumer closed)");
-                        return;
-                    }
-                }
-                Ok(None) => {
-                    tracing::debug!("sse EOF after {n} chunks");
-                    break;
-                }
-                Err(e) => {
-                    tracing::debug!("sse chunk error: {e}");
-                    let _ = splitter.out_send_err(AiError::from(e));
-                    return;
-                }
-            }
-        }
-        let _ = splitter.finish();
-    });
+async fn run_sse(stream: reqwest::Response, tx: StreamSender) {
+    let mut raw_rx = spawn_sse_producer(stream);
 
     let mut parser = AnthropicParser::default();
     while let Some(payload) = raw_rx.recv().await {
