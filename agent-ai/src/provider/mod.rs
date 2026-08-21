@@ -1,12 +1,23 @@
 //! Provider abstraction. Two adapters first: Anthropic SSE + OpenAI-compatible SSE.
 
+pub mod anthropic;
+pub use anthropic::AnthropicProvider;
+
 use crate::error::AiError;
 use crate::model::Model;
 use crate::stream::{StreamEvent, StreamReader};
 use async_trait::async_trait;
-use bytes::Bytes;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::mpsc;
+
+/// A tool exposed to the model (Anthropic `tools` / OpenAI `tools`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
 
 /// A message part in the provider-neutral request body.
 /// agent-session converts its own message types into these.
@@ -50,6 +61,23 @@ pub struct ProviderRequest {
     pub system: String,
     pub messages: Vec<ChatMessage>,
     pub thinking: crate::model::ThinkingLevel,
+    /// max output tokens (provider `max_tokens`)
+    pub max_tokens: usize,
+    /// tools exposed to the model
+    pub tools: Vec<ToolSpec>,
+}
+
+impl ProviderRequest {
+    pub fn new(model: Model, system: String, messages: Vec<ChatMessage>) -> Self {
+        Self {
+            model,
+            system,
+            messages,
+            thinking: crate::model::ThinkingLevel::Medium,
+            max_tokens: 4096,
+            tools: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -74,10 +102,12 @@ pub trait ChatProvider: Send + Sync {
     fn supports_model(&self, model: &Model) -> bool;
 
     /// Fire the request. Transport-specific deserialization happens in stream.rs.
+    /// `api_key` is resolved per-call (runtime override > stored > env).
     async fn chat(
         &self,
         client: &crate::Client,
         req: &ProviderRequest,
+        api_key: &str,
     ) -> Result<ProviderResponse, AiError>;
 
     /// Stub for M3 task: usage extraction after stream completion.
@@ -113,11 +143,4 @@ impl Default for ProviderClient {
     fn default() -> Self {
         Self::new()
     }
-}
-
-pub type BytesStream = Box<dyn StreamBuf + Send>;
-
-#[async_trait]
-pub trait StreamBuf {
-    async fn next(&mut self) -> Option<Result<Bytes, AiError>>;
 }

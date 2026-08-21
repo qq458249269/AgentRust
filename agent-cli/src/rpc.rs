@@ -1,13 +1,13 @@
 //! RPC mode: strict LF JSONL framing over stdin/stdout. Command responses + async events.
 //! Full protocol in M4; here: read commands, echo accept, wire prompt/abort to session.
 
-use crate::Cli;
+use crate::CommonArgs;
 use agent_session::AgentSession;
 use serde_json::{json, Value};
 use std::io::BufRead;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-pub async fn run(_session: AgentSession, _cli: &Cli) -> anyhow::Result<()> {
+pub async fn run(_session: AgentSession, _cli: &CommonArgs) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = BufWriter::new(tokio::io::stdout());
 
