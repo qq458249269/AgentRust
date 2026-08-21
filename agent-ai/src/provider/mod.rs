@@ -260,7 +260,54 @@ pub enum ApiVariant {
     Messages,
 }
 
-/// Provider selection: pick `vendor + api variant` first, then fill in url + key.
+/// Location of the local settings/credentials file: $AGENTRUST_AUTH or ~/.agentrust/auth.json.
+pub fn auth_file_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("AGENTRUST_AUTH")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+            Some(
+                std::path::Path::new(&home)
+                    .join(".agentrust")
+                    .join("auth.json"),
+            )
+        })
+}
+
+/// Read the raw auth.json as a JSON object (empty object if absent/invalid).
+pub fn read_auth_json() -> Value {
+    auth_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// Merge `patch` into the cached auth.json and write it back (creates dirs as needed).
+/// Returns the file path written, or None if no home dir is resolvable.
+pub fn write_auth_json(
+    patch: &Value,
+) -> std::result::Result<Option<std::path::PathBuf>, crate::AiError> {
+    use std::io::Write;
+    let Some(path) = auth_file_path() else {
+        return Ok(None);
+    };
+    let mut root = read_auth_json();
+    if !root.is_object() {
+        root = Value::Object(Default::default());
+    }
+    let obj = root.as_object_mut().expect("object");
+    for (k, v) in patch.as_object().expect("patch must be object") {
+        obj.insert(k.clone(), v.clone());
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(serde_json::to_string_pretty(&root)?.as_bytes())?;
+    Ok(Some(path))
+}
+
+/// Provider selection: pick the vendor + api variant first, then fill in url + key.
 /// CLAUDE.md-friendly glossary: kind=type, key=api key, base_url=url.
 /// Strings look like `anthropic messages`, `openai chat`, `openai responses`,
 /// `deepseek chat`. The variant defaults per vendor when omitted.
@@ -411,5 +458,42 @@ impl ProviderKind {
             return serde_json::from_value(Value::String(s.to_string())).ok();
         }
         serde_json::from_value(v.clone()).ok()
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn tmp_auth() -> std::path::PathBuf {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("agentrust_auth_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let p = tmp_auth();
+        std::env::set_var("AGENTRUST_AUTH", &p);
+        let patch = serde_json::json!({
+            "provider": "openai chat",
+            "openai": {"api_key": "sk-test", "base_url": "http://127.0.0.1:9"},
+            "default_model": "gpt-4o-mini"
+        });
+        let written = write_auth_json(&patch).unwrap();
+        assert_eq!(written.as_deref(), Some(p.as_path()));
+
+        let kind = ProviderKind::parse("openai chat").unwrap();
+        assert_eq!(kind.resolve_key(None).as_deref(), Some("sk-test"));
+        assert_eq!(
+            kind.resolve_base_url(None),
+            "http://127.0.0.1:9".to_string()
+        );
+
+        let root = read_auth_json();
+        assert_eq!(root["default_model"], "gpt-4o-mini");
+        let _ = std::fs::remove_file(&p);
+        std::env::remove_var("AGENTRUST_AUTH");
     }
 }

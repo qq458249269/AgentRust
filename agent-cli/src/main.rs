@@ -3,6 +3,7 @@
 mod json;
 mod print;
 mod rpc;
+mod tui;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -13,33 +14,35 @@ use clap::{Args, Parser, Subcommand};
     about = "high-performance coding agent (DESIGN.md)"
 )]
 struct Cli {
-    /// run mode; rpc is the embeddable default
+    /// run mode; empty = interactive TUI (double-click friendly)
     #[command(subcommand)]
-    mode: Mode,
+    mode: Option<Mode>,
 
     /// working directory for the session
     #[arg(long, global = true, default_value = ".")]
     cwd: String,
 
-    /// provider: anthropic | openai | deepseek ...
-    #[arg(long, global = true, default_value = "anthropic")]
+    /// provider kind override for headless modes (TUI uses auth.json)
+    #[arg(long, global = true, default_value = "")]
     provider: String,
 
-    /// model id pattern, e.g. claude-sonnet-4-5, or provider/id
+    /// model id override for headless modes
     #[arg(long, global = true)]
     model: Option<String>,
 
-    /// override provider base URL (e.g. local mock server); default per provider
+    /// override provider base URL (e.g. local mock server)
     #[arg(long, global = true)]
     base_url: Option<String>,
 
-    /// API key override (kind = provider type); otherwise auth.json then env var
+    /// API key override; otherwise auth.json then env var
     #[arg(long, global = true)]
     api_key: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Mode {
+    /// interactive TUI (default)
+    Tui,
     /// RPC over stdin/stdout (JSONL, LF-only framing)
     Rpc,
     /// all events as JSON lines to stdout
@@ -80,7 +83,8 @@ async fn main() -> anyhow::Result<()> {
         api_key,
     };
 
-    match cli.mode {
+    match cli.mode.unwrap_or(Mode::Tui) {
+        Mode::Tui => tui::run(session, &common).await?,
         Mode::Rpc => rpc::run(session, &common).await?,
         Mode::Json => json::run(session, &common).await?,
         Mode::Print(args) => print::run(session, &common, &args).await?,

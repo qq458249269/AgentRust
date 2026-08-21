@@ -8,12 +8,24 @@ use agent_session::AgentSession;
 
 pub async fn run(_session: AgentSession, cli: &CommonArgs, args: &PrintArgs) -> anyhow::Result<()> {
     // kind first, then url + key (each: override -> auth.json -> env/default)
-    let kind = ProviderKind::parse(&cli.provider)
-        .ok_or_else(|| anyhow::anyhow!("unknown provider kind: {}", cli.provider))?;
-    let model_id = cli
-        .model
-        .clone()
-        .unwrap_or_else(|| "claude-sonnet-4-5".to_string());
+    // kind falls back to auth.json's "provider" when no CLI override is given.
+    let kind_s = if cli.provider.is_empty() {
+        agent_ai::provider::read_auth_json()
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        cli.provider.clone()
+    };
+    let kind = ProviderKind::parse(&kind_s)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider kind: {kind_s}"))?;
+    let default_model = agent_ai::provider::read_auth_json()
+        .get("default_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("claude-sonnet-4-5")
+        .to_string();
+    let model_id = cli.model.clone().unwrap_or(default_model);
     let model = Model {
         provider: kind.id().to_string(),
         id: model_id,
