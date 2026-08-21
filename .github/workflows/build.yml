@@ -73,21 +73,57 @@ jobs:
           retention-days: 30
 
   release:
+    # 仅由 main 分支 push 触发，避免 tag push 导致的递归触发
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-windows-x86_64
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: 检出代码（含完整历史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: 下载构建产物
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: agent-windows-x86_64-*
 
+      - name: 生成版本号（Release）
+        id: version
+        run: echo "version=0.$(date +%Y%m%d).${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+      - name: 获取最近 10 次提交记录
+        id: commits
+        run: |
+          git log -10 --format='- %h %s' --no-merges > commit-log.txt
+          {
+            echo "LOG<<EOF"
+            cat commit-log.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 推送版本标签（确保 tag 存在）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" "$TAG"
+
       - name: 创建 GitHub Pre-release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          body: |
+            ## 📦 最近 10 次提交记录
+
+            ${{ steps.commits.outputs.LOG }}
           files: artifacts/**/*.exe
-          generate_release_notes: true
           draft: false
           prerelease: true
