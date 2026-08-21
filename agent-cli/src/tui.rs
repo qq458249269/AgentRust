@@ -78,7 +78,17 @@ struct ChatApp {
     form_active: usize,
     streaming_item: Option<usize>,
     usage_str: String,
+    /// when Some(selected_index), the `/` command menu is open
+    cmd_menu: Option<usize>,
 }
+
+/// Slash commands shown in the menu: (触发, 说明).
+const COMMANDS: [(&str, &str); 4] = [
+    ("/settings", "配置接口（类型/地址/密钥/模型）"),
+    ("/help", "查看帮助"),
+    ("/clear", "清空会话记录"),
+    ("/exit", "退出"),
+];
 
 enum Mode {
     Chat,
@@ -105,7 +115,7 @@ impl ChatApp {
             mode: Mode::Chat,
             history: vec![ChatItem::new(
                 "system",
-                "AgentRust · 输入 /settings 配置，/help 查看帮助",
+                "AgentRust · 输入 / 打开命令菜单，其他内容发送给模型",
             )],
             input: String::new(),
             busy: false,
@@ -116,6 +126,7 @@ impl ChatApp {
             form_active: 0,
             streaming_item: None,
             usage_str: String::new(),
+            cmd_menu: None,
         }
     }
 
@@ -183,6 +194,7 @@ impl ChatApp {
 
     fn send(&mut self, text: String) {
         if self.busy {
+            self.status = "正在生成中，请稍候…".to_string();
             return;
         }
         self.history.push(ChatItem::new("user", &text));
@@ -438,6 +450,48 @@ fn draw_chat(f: &mut Frame, app: &ChatApp) {
     f.render_widget(input, input_area);
     f.set_cursor_position((input_area.x + app.input.len() as u16 + 1, input_area.y + 1));
 
+    // command menu overlay (dropdown above the input line)
+    if app.cmd_menu.is_some() {
+        let menu_h = COMMANDS.len() as u16 + 2;
+        let menu_area = ratatui::layout::Rect {
+            x: input_area.x + 1,
+            y: input_area.y.saturating_sub(menu_h),
+            width: input_area.width.saturating_sub(2).min(60),
+            height: menu_h,
+        };
+        let menu_lines: Vec<Line> = COMMANDS
+            .iter()
+            .enumerate()
+            .map(|(i, (cmd, desc))| {
+                let selected = Some(i) == app.cmd_menu;
+                if selected {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("▸ {cmd}"),
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  {desc}"),
+                            Style::default().fg(Color::Black).bg(Color::Cyan),
+                        ),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled(format!("  {cmd}"), Style::default().fg(Color::White)),
+                        Span::styled(format!("  {desc}"), Style::default().fg(Color::DarkGray)),
+                    ])
+                }
+            })
+            .collect();
+        let menu = Paragraph::new(menu_lines)
+            .block(Block::default().borders(Borders::ALL).title(" 命令 "))
+            .style(Style::default().bg(Color::Reset));
+        f.render_widget(menu, menu_area);
+    }
+
     // status
     let cfg = format!(
         "{} · 模型: {}",
@@ -598,6 +652,39 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
     if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
         return false; // Ctrl+C quit
     }
+
+    // command menu active: arrows move, enter runs, esc closes
+    if app.cmd_menu.is_some() && app.input == "/" {
+        match code {
+            KeyCode::Up => {
+                let cur = app.cmd_menu.unwrap_or(0);
+                app.cmd_menu = Some((cur + COMMANDS.len() - 1) % COMMANDS.len());
+            }
+            KeyCode::Down => {
+                let cur = app.cmd_menu.unwrap_or(0);
+                app.cmd_menu = Some((cur + 1) % COMMANDS.len());
+            }
+            KeyCode::Enter => {
+                let cmd = COMMANDS[app.cmd_menu.unwrap_or(0)].0;
+                return run_command(app, cmd);
+            }
+            KeyCode::Esc => {
+                app.cmd_menu = None;
+                app.input.clear();
+            }
+            KeyCode::Backspace => {
+                app.cmd_menu = None;
+                app.input.clear();
+            }
+            KeyCode::Char('/') => {
+                // keep menu open, allow typing more (falls through to normal char handling)
+                app.input.push('/');
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     match code {
         KeyCode::Enter => {
             let text = app.input.trim().to_string();
@@ -621,24 +708,62 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                     ));
                     app.input.clear();
                 }
+                "/clear" => {
+                    app.history.clear();
+                    app.history.push(ChatItem::new(
+                        "system",
+                        "AgentRust · 输入 /settings 配置，/help 查看帮助",
+                    ));
+                    app.input.clear();
+                }
                 _ => app.send(text),
             }
             true
         }
         KeyCode::Backspace => {
             app.input.pop();
+            if app.input.is_empty() {
+                app.cmd_menu = None;
+            }
             true
         }
         KeyCode::Char(c) => {
             if c == '/' && app.input.is_empty() {
                 app.input.push(c);
-            } else {
+                app.cmd_menu = Some(0);
+            } else if !app.input.starts_with('/') || c != '/' {
                 app.input.push(c);
             }
             true
         }
         _ => true,
     }
+}
+
+fn run_command(app: &mut ChatApp, cmd: &str) -> bool {
+    app.cmd_menu = None;
+    app.input.clear();
+    match cmd {
+        "/settings" => {
+            app.load_form();
+            app.mode = Mode::Settings;
+            app.status = String::new();
+        }
+        "/help" => {
+            app.history.push(ChatItem::new(
+                "system",
+                "/settings 配置 · /clear 清空 · /exit 退出 · 其他输入发送给模型",
+            ));
+        }
+        "/clear" => {
+            app.history.clear();
+            app.history
+                .push(ChatItem::new("system", "AgentRust · 输入 / 打开命令菜单"));
+        }
+        "/exit" => return false,
+        _ => {}
+    }
+    true
 }
 
 #[cfg(test)]
@@ -663,5 +788,20 @@ mod tests {
     fn cycle_kind_unknown_falls_to_first() {
         assert_eq!(cycle_kind("bogus", true), "openai chat");
         assert_eq!(cycle_kind("bogus", false), "deepseek chat");
+    }
+
+    #[test]
+    fn run_command_dispatches() {
+        let mut app = ChatApp::new();
+        // /settings opens the settings mode
+        assert!(run_command(&mut app, "/settings"));
+        assert!(matches!(app.mode, Mode::Settings));
+        // back to chat
+        app.mode = Mode::Chat;
+        // /clear empties history but keeps the intro line
+        assert!(run_command(&mut app, "/clear"));
+        assert_eq!(app.history.len(), 1);
+        // /exit signals quit
+        assert!(!run_command(&mut app, "/exit"));
     }
 }

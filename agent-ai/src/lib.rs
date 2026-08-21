@@ -13,7 +13,7 @@ pub use model::{Model, ThinkingLevel, Usage};
 pub use provider::{ChatProvider, ProviderClient, ProviderRequest, ProviderResponse};
 pub use stream::{StreamEvent, StreamReader};
 
-/// TODO(M1): share one reqwest::Client (HTTP/2 pooling). Owned here so callers do not build per-request clients.
+/// Shared reqwest::Client (HTTP/2 pooling). Owned here so callers do not build per-request clients.
 pub struct Client {
     inner: reqwest::Client,
 }
@@ -23,6 +23,8 @@ impl Client {
         Self {
             inner: reqwest::Client::builder()
                 .pool_max_idle_per_host(8)
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(600))
                 .build()
                 .expect("reqwest client build"),
         }
