@@ -75,7 +75,6 @@ jobs:
   release:
     needs: build-windows-x86_64
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
