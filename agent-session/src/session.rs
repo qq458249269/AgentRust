@@ -261,11 +261,10 @@ impl AgentSession {
                         }
                     }
                 }
-                MessageContent::ToolResult { content, is_error, .. } => {
-                    if *is_error {
-                        tracing::warn!("工具错误: {}", &content[..content.len().min(200)]);
-                    }
+                MessageContent::ToolResult { content, is_error: true, .. } => {
+                    tracing::warn!("工具错误: {}", &content[..content.len().min(200)]);
                 }
+                MessageContent::ToolResult { .. } => {}
                 _ => {}
             }
 

@@ -248,9 +248,9 @@ impl Tool for EditFileTool {
             .unwrap_or(false);
 
         if is_batch {
-            execute_batch_edit(path, &content, args, &cancel).await
+            execute_batch_edit(path, &content, args, cancel).await
         } else {
-            execute_single_edit(path, &content, args, &cancel).await
+            execute_single_edit(path, &content, args, cancel).await
         }
     }
 }
@@ -625,7 +625,7 @@ impl Tool for ListDirectoryTool {
         }
         if !files.is_empty() {
             if !output.is_empty() {
-                output.push_str("\n");
+                output.push('\n');
             }
             output.push_str("Files:\n");
             for f in &files {
@@ -734,7 +734,7 @@ impl Tool for GlobFindTool {
             Ok(())
         }
 
-        walk(root, &compiled, &mut matches, &cancel)?;
+        walk(root, &compiled, &mut matches, cancel)?;
         matches.sort();
 
         let output = if matches.is_empty() {
@@ -853,6 +853,7 @@ fn grep_search_inner(
     let mut files_searched = 0u32;
     let mut total_matches = 0u32;
 
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         dir: &std::path::Path,
         re: &regex::Regex,
@@ -905,19 +906,20 @@ fn grep_search_inner(
                             if context_lines > 0 {
                                 let start = idx.saturating_sub(context_lines);
                                 let end = (idx + context_lines + 1).min(lines.len());
-                                for ci in start..end {
-                                    if ci == idx {
+                                for (ci, ctx_line_text) in lines[start..end].iter().enumerate() {
+                                    let actual_idx = start + ci;
+                                    if actual_idx == idx {
                                         continue; // skip the match line itself (already shown)
                                     }
-                                    let marker = if ci < idx { "-" } else { "+" };
-                                    let ln = ci + 1;
+                                    let marker = if actual_idx < idx { "-" } else { "+" };
+                                    let ln = actual_idx + 1;
                                     let mut ctx_line = display_path.clone();
                                     ctx_line.push(':');
                                     ctx_line.push_str(&ln.to_string());
                                     ctx_line.push_str(": ");
                                     ctx_line.push_str(marker);
                                     ctx_line.push(' ');
-                                    ctx_line.push_str(lines[ci]);
+                                    ctx_line.push_str(ctx_line_text);
                                     results.push(ctx_line);
                                 }
                             }
