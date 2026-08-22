@@ -5,72 +5,18 @@
 //!   Agent → Client: `{ "id": "1", "type": "response", "command": "prompt", "success": true }`
 //!   Agent → Client: `{ "type": "event", "event": { "type": "delta", "delta": "..." } }`
 //!   Agent → Client: `{ "type": "event", "event": { "type": "turn_end" } }`
+//!
+//! Now uses AgentSession for full agent loop with tool support (bash, read/write/edit, grep, etc.).
 
-use crate::{client, CommonArgs};
-use agent_ai::model::{Model, ThinkingLevel};
-use agent_ai::provider::{ChatMessage, Part, ProviderClient, ProviderKind, ProviderRequest};
-use agent_ai::stream::StreamEvent;
+use crate::CommonArgs;
 use agent_session::AgentSession;
 use serde_json::{json, Value};
 use std::io::BufRead;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-pub async fn run(_session: AgentSession, cli: &CommonArgs) -> anyhow::Result<()> {
+pub async fn run(mut session: AgentSession, _cli: &CommonArgs) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = BufWriter::new(tokio::io::stdout());
-
-    // Resolve provider config
-    let root = agent_ai::provider::read_auth_json();
-    let kind_s = if cli.provider.is_empty() {
-        root.get("provider")
-            .and_then(|v| v.as_str())
-            .unwrap_or("openai chat")
-    } else {
-        &cli.provider
-    };
-    let kind = match ProviderKind::parse(kind_s) {
-        Some(k) => k,
-        None => {
-            send_error(&mut stdout, None, "未配置有效的服务商").await?;
-            return Ok(());
-        }
-    };
-
-    let api_key = kind.resolve_key(cli.api_key.as_deref()).unwrap_or_default();
-    let model_id = cli
-        .model
-        .clone()
-        .or_else(|| {
-            root.get("default_model")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| match kind.id() {
-            "anthropic" => "claude-sonnet-4-5".into(),
-            "openai" => "gpt-4o-mini".into(),
-            _ => "deepseek-chat".into(),
-        });
-
-    let model = Model {
-        provider: kind.id().to_string(),
-        id: model_id,
-        context_window: 200_000,
-        max_tokens: 4096,
-    };
-
-    let mut provider_client = ProviderClient::new();
-    provider_client.setup(kind, Some(api_key), cli.base_url.clone());
-
-    let provider = match provider_client.provider_for(&model) {
-        Some(p) => p,
-        None => {
-            send_error(&mut stdout, None, &format!("没有可用的服务商: {}", model.id)).await?;
-            return Ok(());
-        }
-    };
-
-    // Track conversation history
-    let mut messages: Vec<ChatMessage> = Vec::new();
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -109,100 +55,31 @@ pub async fn run(_session: AgentSession, cli: &CommonArgs) -> anyhow::Result<()>
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
 
-                // Build messages
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    parts: vec![Part::Text { text }],
-                });
-
-                // Call provider
-                let req = ProviderRequest {
-                    model: model.clone(),
-                    system: String::new(),
-                    messages: messages.clone(),
-                    thinking: ThinkingLevel::Off,
-                    max_tokens: 4096,
-                    tools: Vec::new(),
-                };
-
-                match provider.chat(client(), &req).await {
-                    Ok(resp) => {
-                        match resp {
-                            agent_ai::provider::ProviderResponse::Stream(mut sr) => {
-                                let mut text_buf = String::new();
-                                let mut usage = None;
-                                while let Some(ev) = sr.next().await {
-                                    match ev {
-                                        Ok(StreamEvent::TextDelta { delta }) => {
-                                            text_buf.push_str(&delta);
-                                            // Send delta event
-                                            let ev = json!({
-                                                "type": "event",
-                                                "event": {
-                                                    "type": "delta",
-                                                    "delta": delta,
-                                                }
-                                            });
-                                            stdout.write_all(
-                                                serde_json::to_string(&ev)?.as_bytes(),
-                                            ).await?;
-                                            stdout.write_all(b"\n").await?;
-                                        }
-                                        Ok(StreamEvent::Usage { usage: u }) => {
-                                            usage = Some(u);
-                                        }
-                                        Ok(StreamEvent::Done { stop_reason }) => {
-                                            let ev = json!({
-                                                "type": "event",
-                                                "event": {
-                                                    "type": "turn_end",
-                                                    "stop_reason": format!("{stop_reason:?}")
-                                                }
-                                            });
-                                            stdout.write_all(
-                                                serde_json::to_string(&ev)?.as_bytes(),
-                                            ).await?;
-                                            stdout.write_all(b"\n").await?;
-                                        }
-                                        _ => {}
-                                    }
+                // Use AgentSession::prompt() for full agent loop with tools
+                match session.prompt(text).await {
+                    Ok(response_text) => {
+                        // Emit the full response as a delta event (clients can display it)
+                        if !response_text.is_empty() {
+                            let ev = json!({
+                                "type": "event",
+                                "event": {
+                                    "type": "delta",
+                                    "delta": response_text,
                                 }
-                                // Add assistant response to history
-                                messages.push(ChatMessage {
-                                    role: "assistant".into(),
-                                    parts: vec![Part::Text { text: text_buf }],
-                                });
-                                if let Some(u) = usage {
-                                    let ev = json!({
-                                        "type": "event",
-                                        "event": {
-                                            "type": "usage",
-                                            "input": u.input,
-                                            "output": u.output,
-                                        }
-                                    });
-                                    stdout.write_all(
-                                        serde_json::to_string(&ev)?.as_bytes(),
-                                    ).await?;
-                                    stdout.write_all(b"\n").await?;
-                                }
-                            }
-                            agent_ai::provider::ProviderResponse::Done { text, .. } => {
-                                messages.push(ChatMessage {
-                                    role: "assistant".into(),
-                                    parts: vec![Part::Text { text }],
-                                });
-                                let ev = json!({
-                                    "type": "event",
-                                    "event": {
-                                        "type": "turn_end",
-                                        "stop_reason": "stop"
-                                    }
-                                });
-                                stdout.write_all(serde_json::to_string(&ev)?.as_bytes()).await?;
-                                stdout.write_all(b"\n").await?;
-                            }
+                            });
+                            stdout.write_all(serde_json::to_string(&ev)?.as_bytes()).await?;
+                            stdout.write_all(b"\n").await?;
                         }
+                        // Emit turn_end
+                        let ev = json!({
+                            "type": "event",
+                            "event": {
+                                "type": "turn_end",
+                                "stop_reason": "stop"
+                            }
+                        });
+                        stdout.write_all(serde_json::to_string(&ev)?.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
                     }
                     Err(e) => {
                         send_error(&mut stdout, cmd_id.as_ref(), &format!("{e}")).await?;
@@ -222,7 +99,8 @@ pub async fn run(_session: AgentSession, cli: &CommonArgs) -> anyhow::Result<()>
                 stdout.flush().await?;
             }
             "clear" => {
-                messages.clear();
+                // Re-create session to clear state
+                session = crate::setup_session(_cli)?;
                 let resp = json!({
                     "id": cmd_id,
                     "type": "response",

@@ -30,6 +30,12 @@ pub enum MessageContent {
     Text(String),
     /// text, thinking, tool calls interleaved (assistant output)
     Assistant(Vec<ContentBlock>),
+    /// tool execution result linked to a specific tool call
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+        is_error: bool,
+    },
     /// image data carried by reference; decoded only when rendered
     Image {
         mime: String,

@@ -28,9 +28,20 @@ use ratatui::Frame;
 use tokio::sync::mpsc as tokio_mpsc;
 use std::time::{Duration, Instant};
 
-pub async fn run(_session: AgentSession, _cli: &CommonArgs) -> anyhow::Result<()> {
+pub async fn run(session: AgentSession, _cli: &CommonArgs) -> anyhow::Result<()> {
+    // Extract session config for the TUI streaming loop
+    let model = session.model.clone().unwrap_or_else(|| Model {
+        provider: "openai".into(),
+        id: "gpt-4o-mini".into(),
+        context_window: 200_000,
+        max_tokens: 4096,
+    });
+    let tool_registry = session.tool_registry.clone();
+    let tool_specs = builtins::tool_specs_from_registry(&tool_registry);
+    let system_prompt = session.system_prompt.clone();
+
     let mut terminal = ratatui::init();
-    let res = run_loop(&mut terminal).await;
+    let res = run_loop(&mut terminal, model, tool_registry, tool_specs, system_prompt).await;
     ratatui::restore();
     res
 }
@@ -138,7 +149,13 @@ struct ChatApp {
     /// Total tokens used in this session
     total_input_tokens: u64,
     total_output_tokens: u64,
-
+    total_cache_read: u64,
+    total_cache_write: u64,
+    // Agent config (shared with spawned tasks)
+    model: Model,
+    tool_registry: ToolRegistry,
+    tool_specs: Vec<agent_ai::provider::ToolSpec>,
+    system_prompt: String,
 }
 
 impl ChatApp {
@@ -174,7 +191,17 @@ impl ChatApp {
             spinner_tick: Instant::now(),
             total_input_tokens: 0,
             total_output_tokens: 0,
-
+            total_cache_read: 0,
+            total_cache_write: 0,
+            model: Model {
+                provider: "openai".into(),
+                id: "gpt-4o-mini".into(),
+                context_window: 200_000,
+                max_tokens: 4096,
+            },
+            tool_registry: ToolRegistry::default(),
+            tool_specs: Vec::new(),
+            system_prompt: String::new(),
         }
     }
 
@@ -316,48 +343,30 @@ impl ChatApp {
         self.history.push(ChatItem::new("assistant", ""));
         self.streaming_item = Some(item_idx);
 
-        // 构建工具注册表
-        let tool_registry = ToolRegistry::default();
-        builtins::register_builtins(&tool_registry);
-        let tool_specs = builtins::tool_specs_from_registry(&tool_registry);
+        // Clone data for the spawned task
+        let model = self.model.clone();
+        let tool_registry = self.tool_registry.clone();
+        let tool_specs = self.tool_specs.clone();
+        let system_prompt = self.system_prompt.clone();
         let cancel = agent_core::Cancelled::new();
 
         tokio::spawn(async move {
-            let root = read_auth_json();
             tracing::info!("TUI 发送任务启动");
-            let kind_s = root
-                .get("provider")
-                .and_then(|v| v.as_str())
-                .unwrap_or("openai chat");
+
+            // Build provider from the session's model config
+            let kind_s = match model.provider.as_str() {
+                "anthropic" => "anthropic messages",
+                "openai" => "openai chat",
+                "deepseek" => "deepseek chat",
+                _ => "openai chat",
+            };
             let Some(kind) = ProviderKind::parse(kind_s) else {
                 let _ = tx.try_send(StreamMsg::Err(
                     "没有配置有效的 provider；请执行 /settings 设置".into(),
                 ));
                 return;
             };
-            let sec = root.get(kind.id());
-            let api_key = sec
-                .and_then(|s| s.get("api_key"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .or_else(|| kind.resolve_key(None))
-                .unwrap_or_default();
-            let model_id = root
-                .get("default_model")
-                .and_then(|v| v.as_str())
-                .unwrap_or(match kind.id() {
-                    "anthropic" => "claude-sonnet-4-5",
-                    "openai" => "gpt-4o-mini",
-                    _ => "deepseek-chat",
-                })
-                .to_string();
-
-            let model = Model {
-                provider: kind.id().to_string(),
-                id: model_id,
-                context_window: 200_000,
-                max_tokens: 4096,
-            };
+            let api_key = kind.resolve_key(None).unwrap_or_default();
             let mut pc = ProviderClient::new();
             pc.setup(kind, Some(api_key), None);
             let provider = match pc.provider_for(&model) {
@@ -374,8 +383,6 @@ impl ChatApp {
                 role: "user".into(),
                 parts: vec![Part::Text { text }],
             }];
-            let mut got_done = false;
-            let mut final_text = String::new();
 
             for turn in 0..10 {
                 if cancel.is_cancelled() {
@@ -384,7 +391,7 @@ impl ChatApp {
                 tracing::info!("Agent 轮次 {turn}");
                 let req = ProviderRequest {
                     model: model.clone(),
-                    system: "你是一个有工具能力的智能助手。可以执行 bash 命令、读写文件。".to_string(),
+                    system: system_prompt.clone(),
                     messages: messages.clone(),
                     thinking: ThinkingLevel::Off,
                     max_tokens: 4096,
@@ -444,7 +451,6 @@ impl ChatApp {
                                 Ok(agent_ai::stream::StreamEvent::Done { stop_reason: sr }) => {
                                     tracing::info!("收到 Done: {sr:?}");
                                     stop_reason = sr;
-                                    got_done = true;
                                     break;
                                 }
                                 Err(e) => {
@@ -455,8 +461,6 @@ impl ChatApp {
                                 _ => {}
                             }
                         }
-
-                        final_text = text_buf.clone();
 
                         // 发送 usage
                         let _ = tx.try_send(StreamMsg::Done(format!(
@@ -532,7 +536,6 @@ impl ChatApp {
                     }
                     agent_ai::provider::ProviderResponse::Done { text, usage, .. } => {
                         tracing::info!("收到一次性响应: {} 字节", text.len());
-                        final_text = text.clone();
                         let _ = tx.try_send(StreamMsg::Delta(text));
                         let _ = tx.try_send(StreamMsg::Done(format!(
                             "用量：输入={} 输出={}",
@@ -559,8 +562,16 @@ fn spinner_char(frame: usize) -> &'static str {
 
 async fn run_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    model: Model,
+    tool_registry: ToolRegistry,
+    tool_specs: Vec<agent_ai::provider::ToolSpec>,
+    system_prompt: String,
 ) -> anyhow::Result<()> {
     let mut app = ChatApp::new();
+    app.model = model;
+    app.tool_registry = tool_registry;
+    app.tool_specs = tool_specs;
+    app.system_prompt = system_prompt;
     app.load_form();
 
     loop {
@@ -591,6 +602,16 @@ async fn run_loop(
                             if let Some(val) = part.strip_prefix("输出=") {
                                 if let Ok(n) = val.parse::<u64>() {
                                     app.total_output_tokens += n;
+                                }
+                            }
+                            if let Some(val) = part.strip_prefix("缓存读=") {
+                                if let Ok(n) = val.parse::<u64>() {
+                                    app.total_cache_read += n;
+                                }
+                            }
+                            if let Some(val) = part.strip_prefix("缓存写=") {
+                                if let Ok(n) = val.parse::<u64>() {
+                                    app.total_cache_write += n;
                                 }
                             }
                         }
@@ -818,10 +839,23 @@ fn draw_chat(f: &mut Frame, app: &mut ChatApp) {
     };
     let msg_count = app.history.len();
     let stats = if app.total_input_tokens + app.total_output_tokens > 0 {
-        format!(
-            "tok: ↓{} ↑{}",
-            app.total_input_tokens, app.total_output_tokens
-        )
+        let cache_hit_pct = if app.total_input_tokens > 0 {
+            (app.total_cache_read as f64 / app.total_input_tokens as f64 * 100.0) as u64
+        } else {
+            0
+        };
+        if app.total_cache_read > 0 || app.total_cache_write > 0 {
+            format!(
+                "tok: ↓{} ↑{} 📦缓存: {}命中({}%) {}写",
+                app.total_input_tokens, app.total_output_tokens,
+                app.total_cache_read, cache_hit_pct, app.total_cache_write
+            )
+        } else {
+            format!(
+                "tok: ↓{} ↑{}",
+                app.total_input_tokens, app.total_output_tokens
+            )
+        }
     } else {
         String::new()
     };
@@ -1062,16 +1096,18 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                     ));
                     app.input.clear();
                 }
-                "/清空" => {
-                    app.history.clear();
-                    app.history.push(ChatItem::new(
-                        "system",
-                        "AgentRust · 记录已清空",
-                    ));
-                    app.total_input_tokens = 0;
-                    app.total_output_tokens = 0;
-                    app.input.clear();
-                }
+        "/清空" => {
+            app.history.clear();
+            app.history.push(ChatItem::new(
+                "system",
+                "AgentRust · 记录已清空",
+            ));
+            app.total_input_tokens = 0;
+            app.total_output_tokens = 0;
+            app.total_cache_read = 0;
+            app.total_cache_write = 0;
+            app.input.clear();
+        }
                 "/统计" => {
                     let msg_count = app.history.len();
                     let user_msgs = app
@@ -1084,12 +1120,18 @@ fn handle_chat_key(app: &mut ChatApp, code: KeyCode, mods: KeyModifiers) -> bool
                         .iter()
                         .filter(|m| m.role == "assistant")
                         .count();
+                    let cache_hit_pct = if app.total_input_tokens > 0 {
+                        (app.total_cache_read as f64 / app.total_input_tokens as f64 * 100.0) as u64
+                    } else {
+                        0
+                    };
                     app.history.push(ChatItem::new(
                         "system",
                         &format!(
-                            "消息数: {} (用户: {}, 助手: {})\nToken: 输入 {} / 输出 {}",
+                            "消息数: {} (用户: {}, 助手: {})\nToken: 输入 {} / 输出 {}\n缓存: 命中 {} ({}%) / 写入 {}",
                             msg_count, user_msgs, asst_msgs,
-                            app.total_input_tokens, app.total_output_tokens
+                            app.total_input_tokens, app.total_output_tokens,
+                            app.total_cache_read, cache_hit_pct, app.total_cache_write
                         ),
                     ));
                     app.input.clear();
@@ -1158,6 +1200,8 @@ fn run_command(app: &mut ChatApp, cmd: &str) -> bool {
                 .push(ChatItem::new("system", "AgentRust · 记录已清空"));
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
+            app.total_cache_read = 0;
+            app.total_cache_write = 0;
         }
         "/统计" => {
             let msg_count = app.history.len();
@@ -1167,12 +1211,18 @@ fn run_command(app: &mut ChatApp, cmd: &str) -> bool {
                 .iter()
                 .filter(|m| m.role == "assistant")
                 .count();
+            let cache_hit_pct = if app.total_input_tokens > 0 {
+                (app.total_cache_read as f64 / app.total_input_tokens as f64 * 100.0) as u64
+            } else {
+                0
+            };
             app.history.push(ChatItem::new(
                 "system",
                 &format!(
-                    "消息数: {} (用户: {}, 助手: {})\nToken: 输入 {} / 输出 {}",
+                    "消息数: {} (用户: {}, 助手: {})\nToken: 输入 {} / 输出 {}\n缓存: 命中 {} ({}%) / 写入 {}",
                     msg_count, user_msgs, asst_msgs,
-                    app.total_input_tokens, app.total_output_tokens
+                    app.total_input_tokens, app.total_output_tokens,
+                    app.total_cache_read, cache_hit_pct, app.total_cache_write
                 ),
             ));
         }

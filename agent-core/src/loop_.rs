@@ -69,6 +69,7 @@ pub fn estimate_message_tokens(msg: &Message) -> u64 {
                 ContentBlock::ToolCall { arguments, .. } => arguments.len(),
             })
             .sum(),
+        MessageContent::ToolResult { content, .. } => content.len(),
         MessageContent::Image { .. } => 100,
     };
     (content_chars as u64) / 4 + 4 // +4 for role/formatting overhead
@@ -265,8 +266,8 @@ pub async fn run_loop(
 
         let results = registry.run_all(&tool_args, cancel).await;
 
-        // 9. Add tool results as user messages (one per tool call, source order)
-        for (_tc, result) in tool_calls.iter().zip(results) {
+        // 9. Add tool results as ToolResult messages (one per tool call, source order)
+        for (tc, result) in tool_calls.iter().zip(results) {
             let output = match result {
                 Ok(o) => o,
                 Err(e) => ToolOutput {
@@ -278,8 +279,12 @@ pub async fn run_loop(
 
             let result_msg = Message {
                 id: uuid_str(),
-                role: Role::User,
-                content: MessageContent::Text(output.content),
+                role: Role::ToolResult,
+                content: MessageContent::ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: output.content,
+                    is_error: output.is_error,
+                },
                 usage: None,
                 stop_reason: None,
                 timestamp: now_ts(),
@@ -297,13 +302,11 @@ pub async fn run_loop(
 fn convert_messages_for_provider(messages: &[Message]) -> Vec<ChatMessage> {
     let mut result = Vec::new();
     for msg in messages {
-        let parts = match &msg.content {
-            MessageContent::Text(text) => {
-                vec![Part::Text {
-                    text: text.clone(),
-                }]
+        let (role, parts) = match (&msg.role, &msg.content) {
+            (Role::User, MessageContent::Text(text)) => {
+                ("user".to_string(), vec![Part::Text { text: text.clone() }])
             }
-            MessageContent::Assistant(blocks) => {
+            (Role::Assistant, MessageContent::Assistant(blocks)) => {
                 let mut parts = Vec::new();
                 for block in blocks {
                     match block {
@@ -320,20 +323,65 @@ fn convert_messages_for_provider(messages: &[Message]) -> Vec<ChatMessage> {
                         }
                     }
                 }
-                parts
+                ("assistant".to_string(), parts)
             }
-            MessageContent::Image { mime, data } => {
-                // For now, represent images as text placeholder
-                vec![Part::Text {
+            (Role::ToolResult, MessageContent::ToolResult { tool_call_id, content, is_error }) => {
+                ("tool".to_string(), vec![Part::ToolResult {
+                    tool_call_id: tool_call_id.clone(),
+                    content: content.clone(),
+                    is_error: *is_error,
+                }])
+            }
+            // Fallback: map any other combination to text with the appropriate role
+            (_, MessageContent::Text(text)) => {
+                let r = match msg.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::ToolResult => "tool",
+                };
+                (r.to_string(), vec![Part::Text { text: text.clone() }])
+            }
+            (_, MessageContent::Assistant(blocks)) => {
+                let mut parts = Vec::new();
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text(t) => parts.push(Part::Text { text: t.clone() }),
+                        ContentBlock::Thinking(t) => {
+                            parts.push(Part::Thinking { thinking: t.clone() })
+                        }
+                        ContentBlock::ToolCall { id, name, arguments } => {
+                            parts.push(Part::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                            })
+                        }
+                    }
+                }
+                let r = match msg.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::ToolResult => "tool",
+                };
+                (r.to_string(), parts)
+            }
+            (_, MessageContent::ToolResult { tool_call_id, content, is_error }) => {
+                let r = match msg.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::ToolResult => "tool",
+                };
+                (r.to_string(), vec![Part::ToolResult {
+                    tool_call_id: tool_call_id.clone(),
+                    content: content.clone(),
+                    is_error: *is_error,
+                }])
+            }
+            (_, MessageContent::Image { mime, data }) => {
+                ("user".to_string(), vec![Part::Text {
                     text: format!("[image: {mime}, {} bytes]", data.len()),
-                }]
+                }])
             }
-        };
-
-        let role = match msg.role {
-            Role::User => "user".to_string(),
-            Role::Assistant => "assistant".to_string(),
-            Role::ToolResult => "tool".to_string(),
         };
 
         result.push(ChatMessage { role, parts });

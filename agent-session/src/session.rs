@@ -14,7 +14,6 @@ use agent_core::messages::{ContentBlock, Message, MessageContent, Role};
 use agent_core::state::AgentState;
 use agent_core::tools::ToolRegistry;
 use agent_core::Cancelled;
-use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -149,7 +148,7 @@ impl AgentSession {
             })
             .collect();
 
-        // Build tool specs from registry
+        // Build tool specs from registry (with proper input schemas)
         let tool_specs: Vec<ToolSpec> = self
             .tool_registry
             .describe_all()
@@ -159,13 +158,11 @@ impl AgentSession {
                 let parts: Vec<&str> = desc.splitn(2, ':').collect();
                 let name = parts[0].trim().to_string();
                 let description = parts.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
+                let input_schema = agent_core::builtins::tool_input_schema(&name);
                 ToolSpec {
                     name,
                     description,
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {}
-                    }),
+                    input_schema,
                 }
             })
             .collect();
@@ -252,26 +249,34 @@ impl AgentSession {
             }
         }?;
 
-        // 5. Write results to journal
+        // 5. Write ALL results to journal (assistant messages + tool results)
         let mut final_text = String::new();
         for msg in &loop_result.messages {
-            if msg.role == Role::Assistant {
-                // Extract text from assistant message
-                if let MessageContent::Assistant(blocks) = &msg.content {
+            // Extract text for return value
+            match &msg.content {
+                MessageContent::Assistant(blocks) => {
                     for block in blocks {
                         if let ContentBlock::Text(t) = block {
                             final_text.push_str(t);
                         }
                     }
                 }
-                let entry = Entry::Message {
-                    id: msg.id.clone(),
-                    parent_id: self.journal.leaf.clone(),
-                    timestamp: now_iso(),
-                    message: msg.clone(),
-                };
-                self.journal.append(entry);
+                MessageContent::ToolResult { content, is_error, .. } => {
+                    if *is_error {
+                        tracing::warn!("工具错误: {}", &content[..content.len().min(200)]);
+                    }
+                }
+                _ => {}
             }
+
+            // Save to journal
+            let entry = Entry::Message {
+                id: msg.id.clone(),
+                parent_id: self.journal.leaf.clone(),
+                timestamp: now_iso(),
+                message: msg.clone(),
+            };
+            self.journal.append(entry);
         }
 
         // 6. Update usage tracking
@@ -556,6 +561,16 @@ fn serialize_for_summary(messages: &[Message]) -> String {
                     }
                 }
                 s
+            }
+            MessageContent::ToolResult { content, is_error, tool_call_id } => {
+                let prefix = if *is_error { "[错误] " } else { "" };
+                // Truncate long tool results for summary
+                let truncated = if content.len() > 2000 {
+                    format!("{}...", &content[..2000])
+                } else {
+                    content.clone()
+                };
+                format!("{prefix}[工具结果 {tool_call_id}]: {truncated}")
             }
             MessageContent::Image { mime, data } => {
                 format!("[图片: {mime}, {} 字节]", data.len())

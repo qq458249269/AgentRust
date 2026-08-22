@@ -137,7 +137,7 @@ fn serialize_for_summary(messages: &[Message]) -> String {
         let role_str = match msg.role {
             agent_core::messages::Role::User => "User",
             agent_core::messages::Role::Assistant => "Assistant",
-            agent_core::messages::Role::ToolResult => "工具结果",
+            agent_core::messages::Role::ToolResult => "ToolResult",
         };
         let content = match &msg.content {
             MessageContent::Text(t) => t.clone(),
@@ -153,6 +153,16 @@ fn serialize_for_summary(messages: &[Message]) -> String {
                     }
                 }
                 s
+            }
+            MessageContent::ToolResult { content, is_error, tool_call_id } => {
+                let prefix = if *is_error { "[ERROR] " } else { "" };
+                // Truncate long tool results for summary
+                let truncated = if content.len() > 2000 {
+                    format!("{}...", &content[..2000])
+                } else {
+                    content.clone()
+                };
+                format!("{prefix}[tool_result for {tool_call_id}]: {truncated}")
             }
             MessageContent::Image { mime, data } => {
                 format!("[image: {mime}, {} bytes]", data.len())
@@ -177,6 +187,7 @@ fn estimate_tokens(messages: &[Message]) -> u64 {
                     ContentBlock::ToolCall { arguments, .. } => arguments.len(),
                 })
                 .sum(),
+            MessageContent::ToolResult { content, .. } => content.len(),
             MessageContent::Image { .. } => 100,
         })
         .sum();

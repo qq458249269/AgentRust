@@ -41,11 +41,12 @@ impl Default for AnthropicProvider {
 }
 
 /// Request body (subset of fields we send).
+/// `system` is Vec<Value> to support `cache_control` breakpoints for prompt caching.
 #[derive(serde::Serialize)]
 struct Body {
     model: String,
     max_tokens: usize,
-    system: String,
+    system: Vec<Value>,
     messages: Vec<Value>,
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -85,7 +86,7 @@ impl ChatProvider for AnthropicProvider {
             ));
         }
         let messages: Vec<Value> = req.messages.iter().map(conv_message).collect();
-        let tools: Vec<Value> = req
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
             .map(|t| {
@@ -97,6 +98,23 @@ impl ChatProvider for AnthropicProvider {
             })
             .collect();
 
+        // Prompt cache: add cache_control breakpoint to the last tool
+        // (Anthropic caches everything up to and including the breakpoint)
+        if let Some(last_tool) = tools.last_mut() {
+            last_tool["cache_control"] = json!({"type": "ephemeral"});
+        }
+
+        // System prompt with cache_control breakpoint for prompt caching
+        let system_content = if req.system.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({
+                "type": "text",
+                "text": req.system,
+                "cache_control": {"type": "ephemeral"}
+            })]
+        };
+
         let thinking = match req.thinking {
             crate::model::ThinkingLevel::Off => None,
             _ => Some(json!({"type": "enabled", "budget_tokens": 2048})),
@@ -105,7 +123,7 @@ impl ChatProvider for AnthropicProvider {
         let body = Body {
             model: req.model.id.clone(),
             max_tokens: req.max_tokens,
-            system: req.system.clone(),
+            system: system_content,
             messages,
             stream: true,
             tools,
