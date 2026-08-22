@@ -23,8 +23,8 @@ impl Client {
         Self {
             inner: reqwest::Client::builder()
                 .pool_max_idle_per_host(8)
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .timeout(std::time::Duration::from_secs(600))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("reqwest client build"),
         }

@@ -104,11 +104,13 @@ impl ChatProvider for OpenAiChatProvider {
                         let preview = if line.len() > 200 { &line[..200] } else { &line };
                         tracing::info!("OpenAI SSE raw #{line_count}: {preview}");
                         if let Err(e) = parser.feed(&line, &tx).await {
+                            tracing::error!("OpenAI SSE parse error: {e}");
                             let _ = tx.send(Err(e)).await;
                             return;
                         }
                     }
                     Err(e) => {
+                        tracing::error!("OpenAI SSE channel error: {e}");
                         let _ = tx.send(Err(e)).await;
                         return;
                     }
@@ -255,6 +257,8 @@ struct ChatCompletionsParser {
     input: u64,
     output: u64,
     total: u64,
+    /// 前缀缓存命中 token 数 (OpenAI: prompt_tokens_details.cached_tokens)
+    cache_read: u64,
     stop: StopReason,
     saw_stop: bool,
     /// accumulate tool call fragments per index: (id, name, args)
@@ -332,6 +336,10 @@ impl ChatCompletionsParser {
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             self.total = u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0);
+            // OpenAI prefix cache: prompt_tokens_details.cached_tokens
+            if let Some(details) = u.get("prompt_tokens_details") {
+                self.cache_read = details.get("cached_tokens").and_then(Value::as_u64).unwrap_or(0);
+            }
         }
 
         for choice in &chunk.choices {
@@ -393,27 +401,30 @@ impl ChatCompletionsParser {
                     "content_filter" | "stop" => StopReason::Stop,
                     _ => StopReason::Stop,
                 };
-                self.saw_stop = true;
-                // emit Usage before Done; usage may be in the same chunk
-                if self.input + self.output + self.total > 0 {
-                    let usage = Usage {
-                        input: self.input,
-                        output: self.output,
-                        cache_read: 0,
-                        cache_write: 0,
-                        total: self.total,
-                        cost: 0.0,
-                    };
-                    tracing::info!("OpenAI 发送 Usage: in={} out={}", usage.input, usage.output);
-                    tx.send(Ok(StreamEvent::Usage { usage }))
+                // 防止重复发送：某些 provider 会在多个 chunk 中重复发送 finish_reason
+                if !self.saw_stop {
+                    self.saw_stop = true;
+                    // emit Usage before Done; usage may be in the same chunk
+                    if self.input + self.output + self.total > 0 {
+                        let usage = Usage {
+                            input: self.input,
+                            output: self.output,
+                            cache_read: self.cache_read,
+                            cache_write: 0,
+                            total: self.total,
+                            cost: 0.0,
+                        };
+                        tracing::info!("OpenAI 发送 Usage: in={} out={}", usage.input, usage.output);
+                        tx.send(Ok(StreamEvent::Usage { usage }))
+                            .await
+                            .map_err(|_| AiError::Other("流已关闭".into()))?;
+                    }
+                    let sr = self.stop;
+                    tracing::info!("OpenAI 发送 Done: {sr:?}");
+                    tx.send(Ok(StreamEvent::Done { stop_reason: sr }))
                         .await
                         .map_err(|_| AiError::Other("流已关闭".into()))?;
                 }
-                let sr = self.stop;
-                tracing::info!("OpenAI 发送 Done: {sr:?}");
-                tx.send(Ok(StreamEvent::Done { stop_reason: sr }))
-                    .await
-                    .map_err(|_| AiError::Other("流已关闭".into()))?;
             }
         }
         Ok(())

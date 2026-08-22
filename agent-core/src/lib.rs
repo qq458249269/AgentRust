@@ -1,5 +1,6 @@
 //! agent-core: LLM loop, tool executor, cancellation. No session/IO concepts (mirrors pi-agent-core).
 
+pub mod builtins;
 pub mod cancel;
 pub mod error;
 pub mod loop_; // loop_ because `loop` is a keyword

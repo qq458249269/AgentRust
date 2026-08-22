@@ -15,6 +15,8 @@ use agent_ai::provider::{
     read_auth_json, write_auth_json, ChatMessage, Part, ProviderClient, ProviderKind,
     ProviderRequest,
 };
+use agent_core::builtins;
+use agent_core::tools::{ToolArgs, ToolRegistry};
 use agent_session::AgentSession;
 use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -99,6 +101,13 @@ enum StreamMsg {
     Delta(String),
     Done(String),
     Err(String),
+}
+
+/// Tracks a single in-flight tool call accumulated from streaming deltas.
+struct PendingToolCall {
+    id: String,
+    name: String,
+    args_buf: String,
 }
 
 // ─── App State ──────────────────────────────────────────────────────
@@ -307,6 +316,12 @@ impl ChatApp {
         self.history.push(ChatItem::new("assistant", ""));
         self.streaming_item = Some(item_idx);
 
+        // 构建工具注册表
+        let tool_registry = ToolRegistry::default();
+        builtins::register_builtins(&tool_registry);
+        let tool_specs = builtins::tool_specs_from_registry(&tool_registry);
+        let cancel = agent_core::Cancelled::new();
+
         tokio::spawn(async move {
             let root = read_auth_json();
             tracing::info!("TUI 发送任务启动");
@@ -353,69 +368,179 @@ impl ChatApp {
                 }
             };
             tracing::info!("请求: provider={}", kind_s);
-            let req = ProviderRequest {
-                model,
-                system: String::new(),
-                messages: vec![ChatMessage {
-                    role: "user".into(),
-                    parts: vec![Part::Text { text }],
-                }],
-                thinking: ThinkingLevel::Off,
-                max_tokens: 4096,
-                tools: Vec::new(),
-            };
-            let resp = match provider.chat(client(), &req).await {
-                Ok(r) => {
-                    tracing::info!("收到 HTTP 响应");
-                    r
+
+            // ── Agent Loop: 支持多轮工具调用 ──
+            let mut messages: Vec<ChatMessage> = vec![ChatMessage {
+                role: "user".into(),
+                parts: vec![Part::Text { text }],
+            }];
+            let mut got_done = false;
+            let mut final_text = String::new();
+
+            for turn in 0..10 {
+                if cancel.is_cancelled() {
+                    break;
                 }
-                Err(e) => {
-                    tracing::error!("请求失败: {e}");
-                    let _ = tx.try_send(StreamMsg::Err(format!("{e}")));
-                    return;
-                }
-            };
-            match resp {
-                agent_ai::provider::ProviderResponse::Stream(mut sr) => {
-                    tracing::info!("开始接收流式响应");
-                    while let Some(ev) = sr.next().await {
-                        match ev {
-                            Ok(agent_ai::stream::StreamEvent::TextDelta { delta }) => {
-                                tracing::trace!("收到 Delta: {} 字节", delta.len());
-                                let _ = tx.try_send(StreamMsg::Delta(delta));
-                            }
-                            Ok(agent_ai::stream::StreamEvent::Usage { usage }) => {
-                                tracing::info!("收到 Usage: in={} out={}", usage.input, usage.output);
-                                let _ = tx.try_send(StreamMsg::Done(format!(
-                                    "用量：输入={} 输出={} 缓存读={} 缓存写={} 总计={}",
-                                    usage.input,
-                                    usage.output,
-                                    usage.cache_read,
-                                    usage.cache_write,
-                                    usage.total
-                                )));
-                            }
-                            Ok(agent_ai::stream::StreamEvent::Done { stop_reason }) => {
-                                tracing::info!("收到 Done: {stop_reason:?}");
-                                let _ = tx.try_send(StreamMsg::Done(format!("结束：{stop_reason:?}")));
-                            }
-                            Err(e) => {
-                                tracing::error!("流错误: {e}");
-                                let _ = tx.try_send(StreamMsg::Err(format!("{e}")));
-                            }
-                            _ => {}
-                        }
+                tracing::info!("Agent 轮次 {turn}");
+                let req = ProviderRequest {
+                    model: model.clone(),
+                    system: "你是一个有工具能力的智能助手。可以执行 bash 命令、读写文件。".to_string(),
+                    messages: messages.clone(),
+                    thinking: ThinkingLevel::Off,
+                    max_tokens: 4096,
+                    tools: tool_specs.clone(),
+                };
+                let resp = match provider.chat(client(), &req).await {
+                    Ok(r) => {
+                        tracing::info!("收到 HTTP 响应");
+                        r
                     }
-                    tracing::info!("流式响应接收完毕");
+                    Err(e) => {
+                        tracing::error!("请求失败: {e}");
+                        let _ = tx.try_send(StreamMsg::Err(format!("{e}")));
+                        return;
+                    }
+                };
+
+                match resp {
+                    agent_ai::provider::ProviderResponse::Stream(mut sr) => {
+                        tracing::info!("开始接收流式响应");
+                        let mut text_buf = String::new();
+                        let mut tool_calls: Vec<PendingToolCall> = Vec::new();
+                        let mut active_tool_idx: Option<usize> = None;
+                        let mut stop_reason = agent_ai::stream::StopReason::Stop;
+                        let mut usage = agent_ai::model::Usage::default();
+
+                        while let Some(ev) = sr.next().await {
+                            if cancel.is_cancelled() {
+                                let _ = tx.try_send(StreamMsg::Err("已取消".into()));
+                                return;
+                            }
+                            match ev {
+                                Ok(agent_ai::stream::StreamEvent::TextDelta { delta }) => {
+                                    tracing::trace!("收到 Delta: {} 字节", delta.len());
+                                    text_buf.push_str(&delta);
+                                    let _ = tx.try_send(StreamMsg::Delta(delta));
+                                }
+                                Ok(agent_ai::stream::StreamEvent::ToolCallStarted { id, name }) => {
+                                    tracing::info!("工具调用开始: {name}({id})");
+                                    let _ = tx.try_send(StreamMsg::Delta(format!(
+                                        "\n🔧 {name}(...)\n"
+                                    )));
+                                    tool_calls.push(PendingToolCall { id, name, args_buf: String::new() });
+                                    active_tool_idx = Some(tool_calls.len() - 1);
+                                }
+                                Ok(agent_ai::stream::StreamEvent::ToolCallArgsDelta { delta, .. }) => {
+                                    if let Some(idx) = active_tool_idx {
+                                        if idx < tool_calls.len() {
+                                            tool_calls[idx].args_buf.push_str(&delta);
+                                        }
+                                    }
+                                }
+                                Ok(agent_ai::stream::StreamEvent::Usage { usage: u }) => {
+                                    tracing::info!("收到 Usage: in={} out={}", u.input, u.output);
+                                    usage = u;
+                                }
+                                Ok(agent_ai::stream::StreamEvent::Done { stop_reason: sr }) => {
+                                    tracing::info!("收到 Done: {sr:?}");
+                                    stop_reason = sr;
+                                    got_done = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::error!("流错误: {e}");
+                                    let _ = tx.try_send(StreamMsg::Err(format!("{e}")));
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        final_text = text_buf.clone();
+
+                        // 发送 usage
+                        let _ = tx.try_send(StreamMsg::Done(format!(
+                            "用量：输入={} 输出={} 缓存读={} 缓存写={} 总计={}",
+                            usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total
+                        )));
+
+                        // 如果是工具调用，执行工具并继续循环
+                        if stop_reason == agent_ai::stream::StopReason::ToolUse && !tool_calls.is_empty() {
+                            tracing::info!("执行 {} 个工具调用", tool_calls.len());
+                            let _ = tx.try_send(StreamMsg::Delta(format!(
+                                "\n⏳ 执行 {} 个工具...\n", tool_calls.len()
+                            )));
+
+                            // 构建 assistant message with tool calls
+                            let mut assistant_parts = Vec::new();
+                            if !text_buf.is_empty() {
+                                assistant_parts.push(Part::Text { text: text_buf });
+                            }
+                            for tc in &tool_calls {
+                                assistant_parts.push(Part::ToolCall {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    arguments: tc.args_buf.clone(),
+                                });
+                            }
+                            messages.push(ChatMessage {
+                                role: "assistant".into(),
+                                parts: assistant_parts,
+                            });
+
+                            // 执行工具
+                            for tc in &tool_calls {
+                                let parsed: serde_json::Value = serde_json::from_str(&tc.args_buf)
+                                    .unwrap_or(serde_json::Value::Null);
+                                let tool_args = ToolArgs {
+                                    call_id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    arguments: parsed,
+                                };
+                                let result = match tool_registry.get(&tc.name) {
+                                    Some(tool) => tool.execute(&tool_args, &cancel, None).await,
+                                    None => Err(agent_core::CoreError::Tool(format!("未知工具: {}", tc.name))),
+                                };
+                                let output = match result {
+                                    Ok(o) => o,
+                                    Err(e) => agent_core::tools::ToolOutput {
+                                        content: format!("[error] {e}"),
+                                        full_output_path: None,
+                                        is_error: true,
+                                    },
+                                };
+                                let _ = tx.try_send(StreamMsg::Delta(format!(
+                                    "{}\n", output.content
+                                )));
+                                messages.push(ChatMessage {
+                                    role: "tool".into(),
+                                    parts: vec![Part::ToolResult {
+                                        tool_call_id: tc.id.clone(),
+                                        content: output.content,
+                                        is_error: output.is_error,
+                                    }],
+                                });
+                            }
+
+                            // 继续下一轮 LLM 调用
+                            let _ = tx.try_send(StreamMsg::Delta("\n🔄 继续对话...\n".to_string()));
+                            continue;
+                        }
+
+                        // 没有工具调用，结束
+                        let _ = tx.try_send(StreamMsg::Done(format!("结束：{stop_reason:?}")));
+                    }
+                    agent_ai::provider::ProviderResponse::Done { text, usage, .. } => {
+                        tracing::info!("收到一次性响应: {} 字节", text.len());
+                        final_text = text.clone();
+                        let _ = tx.try_send(StreamMsg::Delta(text));
+                        let _ = tx.try_send(StreamMsg::Done(format!(
+                            "用量：输入={} 输出={}",
+                            usage.input, usage.output
+                        )));
+                    }
                 }
-                agent_ai::provider::ProviderResponse::Done { text, usage, .. } => {
-                    tracing::info!("收到一次性响应: {} 字节", text.len());
-                    let _ = tx.try_send(StreamMsg::Delta(text));
-                    let _ = tx.try_send(StreamMsg::Done(format!(
-                        "用量：输入={} 输出={}",
-                        usage.input, usage.output
-                    )));
-                }
+                break; // 如果没有工具调用，跳出循环
             }
             tracing::info!("TUI 发送任务结束");
         });
